@@ -54,24 +54,125 @@ object MarkdownParser {
         }
 
     /**
-     * Pre-process LaTeX so Markwon can render it correctly.
-     * Converts $...$ to \(...\) and $$...$$ to \[...\]
-     * This is more reliable than relying on JLatexMathPlugin inline detection.
+     * Convert LaTeX math to Unicode symbols.
+     * This works WITHOUT any LaTeX rendering plugin.
+     * Handles the math symbols common in Chinese middle/high school math.
      */
-    fun preprocessLatex(text: String): String {
-        var result = text
-        // Block math: $$...$$ -> \[...\]  (must do before inline)
-        result = Regex("""\$\$([\s\S]+?)\$\$""").replace(result) { mr ->
-            "\\[${mr.groupValues[1]}\\]"
+    fun renderMath(text: String): String {
+        var s = text
+
+        // ── Step 1: extract and convert $...$ and $$...$$ blocks ──────────
+        // Block math $$...$$
+        s = Regex("""\$\$([\s\S]+?)\$\$""").replace(s) { mr ->
+            "\n" + convertLatex(mr.groupValues[1].trim()) + "\n"
         }
-        // Inline math: $...$ -> \(...\)
-        // Avoid replacing already-converted \[...\] and currency like $10
-        result = Regex("""\$([^$\n]+?)\$""").replace(result) { mr ->
-            val inner = mr.groupValues[1].trim()
-            // Skip if it looks like currency (starts with digit or is very short)
-            if (inner.isEmpty()) mr.value
-            else "\\(${mr.groupValues[1]}\\)"
+        // Inline math $...$
+        s = Regex("""\$([^$\n]+?)\$""").replace(s) { mr ->
+            convertLatex(mr.groupValues[1])
         }
-        return result
+
+        // ── Step 2: convert any remaining bare LaTeX commands ─────────────
+        // (for markdown files that use LaTeX without $ delimiters)
+        s = convertLatex(s)
+
+        return s
+    }
+
+    private fun convertLatex(expr: String): String {
+        var s = expr
+
+        // Fractions: \frac{a}{b} → a/b
+        s = Regex("""\\frac\{([^}]+)\}\{([^}]+)\}""").replace(s) { mr ->
+            "${mr.groupValues[1]}/${mr.groupValues[2]}"
+        }
+        // Superscripts: x^{abc} → x^abc,  x^2 → x²
+        s = Regex("""\^\\circ""").replace(s, "°")
+        s = Regex("""\^\{([^}]+)\}""").replace(s) { mr -> toSuperscript(mr.groupValues[1]) }
+        s = Regex("""\^(\d)""").replace(s) { mr -> toSuperscript(mr.groupValues[1]) }
+        // Subscripts: x_{abc} → x_abc
+        s = Regex("""_\{([^}]+)\}""").replace(s) { mr -> "_${mr.groupValues[1]}" }
+        // Square root
+        s = Regex("""\\sqrt\{([^}]+)\}""").replace(s) { mr -> "√${mr.groupValues[1]}" }
+        s = Regex("""\\sqrt(\d)""").replace(s) { mr -> "√${mr.groupValues[1]}" }
+
+        // Relations & operators
+        s = s.replace("\\parallel",   "∥")
+        s = s.replace("\\perp",       "⊥")
+        s = s.replace("\\angle",      "∠")
+        s = s.replace("\\triangle",   "△")
+        s = s.replace("\\sim",        "∼")
+        s = s.replace("\\cong",       "≅")
+        s = s.replace("\\neq",        "≠")
+        s = s.replace("\\ne",         "≠")
+        s = s.replace("\\leq",        "≤")
+        s = s.replace("\\le",         "≤")
+        s = s.replace("\\geq",        "≥")
+        s = s.replace("\\ge",         "≥")
+        s = s.replace("\\approx",     "≈")
+        s = s.replace("\\equiv",      "≡")
+        s = s.replace("\\times",      "×")
+        s = s.replace("\\div",        "÷")
+        s = s.replace("\\pm",         "±")
+        s = s.replace("\\cdot",       "·")
+        s = s.replace("\\circ",       "°")
+        s = s.replace("\\degree",     "°")
+
+        // Set operations
+        s = s.replace("\\in",         "∈")
+        s = s.replace("\\notin",      "∉")
+        s = s.replace("\\subset",     "⊂")
+        s = s.replace("\\subseteq",   "⊆")
+        s = s.replace("\\cup",        "∪")
+        s = s.replace("\\cap",        "∩")
+        s = s.replace("\\emptyset",   "∅")
+        s = s.replace("\\varnothing", "∅")
+
+        // Arrows
+        s = s.replace("\\rightarrow",     "→")
+        s = s.replace("\\leftarrow",      "←")
+        s = s.replace("\\Rightarrow",     "⇒")
+        s = s.replace("\\Leftarrow",      "⇐")
+        s = s.replace("\\Leftrightarrow", "⇔")
+        s = s.replace("\\leftrightarrow", "↔")
+
+        // Greek letters
+        s = s.replace("\\alpha",  "α"); s = s.replace("\\Alpha",  "Α")
+        s = s.replace("\\beta",   "β"); s = s.replace("\\Beta",   "Β")
+        s = s.replace("\\gamma",  "γ"); s = s.replace("\\Gamma",  "Γ")
+        s = s.replace("\\delta",  "δ"); s = s.replace("\\Delta",  "Δ")
+        s = s.replace("\\epsilon","ε"); s = s.replace("\\varepsilon","ε")
+        s = s.replace("\\theta",  "θ"); s = s.replace("\\Theta",  "Θ")
+        s = s.replace("\\lambda", "λ"); s = s.replace("\\Lambda", "Λ")
+        s = s.replace("\\mu",     "μ")
+        s = s.replace("\\pi",     "π"); s = s.replace("\\Pi",     "Π")
+        s = s.replace("\\sigma",  "σ"); s = s.replace("\\Sigma",  "Σ")
+        s = s.replace("\\phi",    "φ"); s = s.replace("\\Phi",    "Φ")
+        s = s.replace("\\omega",  "ω"); s = s.replace("\\Omega",  "Ω")
+
+        // Trig / functions
+        s = s.replace("\\sin",   "sin"); s = s.replace("\\cos", "cos")
+        s = s.replace("\\tan",   "tan"); s = s.replace("\\log", "log")
+        s = s.replace("\\lg",    "lg");  s = s.replace("\\ln",  "ln")
+        s = s.replace("\\max",   "max"); s = s.replace("\\min", "min")
+
+        // Misc
+        s = s.replace("\\ldots",  "…"); s = s.replace("\\cdots", "⋯")
+        s = s.replace("\\infty",  "∞")
+        s = s.replace("\\because","∵"); s = s.replace("\\therefore","∴")
+        s = s.replace("\\overline",""); // e.g. \overline{AB} → AB (can't do overline in plain text)
+
+        // Remove remaining braces and known commands that have no Unicode equivalent
+        s = Regex("""\\[a-zA-Z]+\{([^}]*)\}""").replace(s) { mr -> mr.groupValues[1] }
+        s = Regex("""\\[a-zA-Z]+""").replace(s, "")
+        s = s.replace("{", "").replace("}", "")
+
+        return s
+    }
+
+    private fun toSuperscript(str: String): String {
+        val supMap = mapOf('0' to '⁰','1' to '¹','2' to '²','3' to '³','4' to '⁴',
+            '5' to '⁵','6' to '⁶','7' to '⁷','8' to '⁸','9' to '⁹',
+            'n' to 'ⁿ','+' to '⁺','-' to '⁻','(' to '⁽',')' to '⁾')
+        return str.map { supMap[it] ?: it }.joinToString("")
     }
 }
