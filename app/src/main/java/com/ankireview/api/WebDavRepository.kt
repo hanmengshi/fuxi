@@ -11,7 +11,7 @@ import okhttp3.logging.HttpLoggingInterceptor
 import java.util.concurrent.TimeUnit
 
 data class WebDavItem(
-    val href: String,
+    val href: String,          // relative path, e.g. /72数学 or /72数学/file.md
     val name: String,
     val isDirectory: Boolean,
     val contentType: String = "",
@@ -42,10 +42,13 @@ class WebDavRepository(
 
     private val credential = Credentials.basic(username, password)
 
+    // baseUrl = https://dav.jianguoyun.com/dav
     private fun baseUrl() = serverUrl.trimEnd('/')
 
-    private fun url(path: String): String {
-        val p = if (path.startsWith("/")) path else "/$path"
+    // Build full URL from a relative path like "/72数学/file.md"
+    // href stored in WebDavItem is already stripped of the /dav prefix
+    private fun fullUrl(relativePath: String): String {
+        val p = if (relativePath.startsWith("/")) relativePath else "/$relativePath"
         return "${baseUrl()}$p"
     }
 
@@ -53,7 +56,7 @@ class WebDavRepository(
         try {
             val body = """<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"""
             val req = Request.Builder()
-                .url(url("/"))
+                .url("${baseUrl()}/")
                 .header("Authorization", credential)
                 .header("Depth", "0")
                 .method("PROPFIND", body.toRequestBody("application/xml; charset=utf-8".toMediaType()))
@@ -67,21 +70,22 @@ class WebDavRepository(
         }
     }
 
-    suspend fun listFolder(path: String): List<WebDavItem> = withContext(Dispatchers.IO) {
+    suspend fun listFolder(relativePath: String): List<WebDavItem> = withContext(Dispatchers.IO) {
         val body = """<?xml version="1.0"?>
-            <d:propfind xmlns:d="DAV:">
-              <d:prop>
-                <d:resourcetype/>
-                <d:getcontenttype/>
-                <d:getcontentlength/>
-                <d:displayname/>
-              </d:prop>
-            </d:propfind>""".trimIndent()
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:resourcetype/>
+    <d:getcontenttype/>
+    <d:getcontentlength/>
+    <d:displayname/>
+  </d:prop>
+</d:propfind>""".trimIndent()
 
-        val targetUrl = if (path.isBlank() || path == "root") {
-            url("/")
+        val targetUrl = if (relativePath.isBlank() || relativePath == "root") {
+            "${baseUrl()}/"
         } else {
-            url("/${path.trimStart('/')}/")
+            val p = relativePath.trimStart('/')
+            "${baseUrl()}/$p/"
         }
 
         val req = Request.Builder()
@@ -92,16 +96,16 @@ class WebDavRepository(
             .build()
 
         val resp = client.newCall(req).execute()
-        if (!resp.isSuccessful && resp.code != 207) {
+        if (resp.code != 207 && !resp.isSuccessful) {
             throw Exception("加载失败 (${resp.code})，请检查文件夹路径是否正确")
         }
         val xml = resp.body?.string() ?: return@withContext emptyList()
-        parseWebDavResponse(xml, path)
+        parseWebDavResponse(xml, relativePath)
     }
 
-    suspend fun readFile(path: String): String = withContext(Dispatchers.IO) {
+    suspend fun readFile(relativePath: String): String = withContext(Dispatchers.IO) {
         val req = Request.Builder()
-            .url(url("/${path.trimStart('/')}"))
+            .url(fullUrl(relativePath))
             .header("Authorization", credential)
             .get()
             .build()
@@ -110,9 +114,9 @@ class WebDavRepository(
         resp.body?.string() ?: ""
     }
 
-    suspend fun readFileBytes(path: String): ByteArray = withContext(Dispatchers.IO) {
+    suspend fun readFileBytes(relativePath: String): ByteArray = withContext(Dispatchers.IO) {
         val req = Request.Builder()
-            .url(url("/${path.trimStart('/')}"))
+            .url(fullUrl(relativePath))
             .header("Authorization", credential)
             .get()
             .build()
@@ -120,9 +124,9 @@ class WebDavRepository(
         resp.body?.bytes() ?: ByteArray(0)
     }
 
-    suspend fun writeFile(path: String, content: String) = withContext(Dispatchers.IO) {
+    suspend fun writeFile(relativePath: String, content: String) = withContext(Dispatchers.IO) {
         val req = Request.Builder()
-            .url(url("/${path.trimStart('/')}"))
+            .url(fullUrl(relativePath))
             .header("Authorization", credential)
             .put(content.toRequestBody("text/plain; charset=utf-8".toMediaType()))
             .build()
@@ -143,23 +147,37 @@ class WebDavRepository(
         val ctypeRegex    = Regex("<[Dd]:getcontenttype[^>]*>(.*?)</[Dd]:getcontenttype>")
         val sizeRegex     = Regex("<[Dd]:getcontentlength[^>]*>(.*?)</[Dd]:getcontentlength>")
 
+        // Determine the server's WebDAV prefix to strip (e.g. "/dav")
+        val davPrefix = try {
+            java.net.URL(serverUrl).path.trimEnd('/')  // e.g. "/dav"
+        } catch (e: Exception) { "/dav" }
+
         responseRegex.findAll(xml).forEach { match ->
             val block = match.groupValues[1]
-            val href  = hrefRegex.find(block)?.groupValues?.get(1)?.trim() ?: return@forEach
-            val isDir = collRegex.containsMatchIn(block)
-            val ctype = ctypeRegex.find(block)?.groupValues?.get(1)?.trim() ?: ""
-            val size  = sizeRegex.find(block)?.groupValues?.get(1)?.trim()?.toLongOrNull() ?: 0L
+            val rawHref = hrefRegex.find(block)?.groupValues?.get(1)?.trim() ?: return@forEach
+            val isDir   = collRegex.containsMatchIn(block)
+            val ctype   = ctypeRegex.find(block)?.groupValues?.get(1)?.trim() ?: ""
+            val size    = sizeRegex.find(block)?.groupValues?.get(1)?.trim()?.toLongOrNull() ?: 0L
 
-            val decoded = java.net.URLDecoder.decode(href, "UTF-8").trimEnd('/')
-            val name    = decoded.substringAfterLast('/')
-            if (name.isEmpty()) return@forEach
+            // URL-decode the href
+            val decoded = java.net.URLDecoder.decode(rawHref, "UTF-8").trimEnd('/')
 
-            // 跳过自身（当前目录条目）
+            // Strip the /dav prefix so we only keep relative paths like /72数学/file.md
+            val relativePath = if (decoded.startsWith(davPrefix)) {
+                decoded.substring(davPrefix.length)
+            } else {
+                decoded
+            }
+
+            val name = relativePath.substringAfterLast('/')
+            if (name.isEmpty()) return@forEach  // skip self
+
+            // Skip the current folder itself
             val baseSegment = basePath.trimEnd('/').substringAfterLast('/')
-            if (name == baseSegment) return@forEach
+            if (name == baseSegment && relativePath.trimEnd('/').endsWith(basePath.trimEnd('/'))) return@forEach
 
             items.add(WebDavItem(
-                href        = decoded,
+                href        = relativePath,
                 name        = name,
                 isDirectory = isDir,
                 contentType = ctype,
