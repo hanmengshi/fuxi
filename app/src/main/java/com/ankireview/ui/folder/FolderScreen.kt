@@ -106,7 +106,7 @@ fun FolderScreen(viewModel: ReviewViewModel) {
                 items(folders) { folder ->
                     FolderCard(
                         icon = "📂", name = folder.name,
-                        subtitle = if (folder.childCount > 0) "${folder.childCount} 个文件" else "点击进入",
+                        subtitle = "点击进入",
                         selected = false,
                         onClick = { viewModel.loadFolder(folder.href) },
                         trailing = { Icon(Icons.Default.ChevronRight, null,
