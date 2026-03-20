@@ -78,8 +78,9 @@ class ReviewViewModel @Inject constructor(
     val snack: SharedFlow<String> = _snack.asSharedFlow()
 
     private var webDav: WebDavRepository? = null
-    private var queue: ArrayDeque<CardEntity> = ArrayDeque()
-    private var totalSession = 0
+    // Use a simple list + index to avoid queue mutation bugs
+    private var sessionCards: List<CardEntity> = emptyList()
+    private var currentIndex: Int = 0
     private val imageCache = mutableMapOf<String, String>()
 
     init {
@@ -123,6 +124,8 @@ class ReviewViewModel @Inject constructor(
             ctx.dataStore.edit { it.clear() }
             webDav = null
             imageCache.clear()
+            sessionCards = emptyList()
+            currentIndex = 0
             _state.value = ReviewUiState()
             _screen.value = Screen.Login
         }
@@ -165,8 +168,7 @@ class ReviewViewModel @Inject constructor(
 
     // ── Start review ──────────────────────────────
     fun startReview(files: List<WebDavItem>) {
-        val dav = webDav
-        if (dav == null) {
+        val dav = webDav ?: run {
             viewModelScope.launch { _snack.emit("未连接坚果云，请重新登录") }
             return
         }
@@ -180,16 +182,19 @@ class ReviewViewModel @Inject constructor(
                 val today = LocalDate.now().toString()
                 val limit = _state.value.dailyLimit
 
+                // Ensure all files are in DB
                 val allCards = withContext(Dispatchers.IO) {
                     val result = mutableListOf<CardEntity>()
                     for (f in files) {
                         val card = db.cardDao().getCard(f.href)
-                            ?: CardEntity(path = f.href, name = f.name).also { db.cardDao().upsertCard(it) }
+                            ?: CardEntity(path = f.href, name = f.name)
+                                .also { db.cardDao().upsertCard(it) }
                         result.add(card)
                     }
                     result
                 }
 
+                // Sort into buckets
                 val due    = allCards.filter { it.due <= today }.shuffled()
                 val newC   = allCards.filter { it.reps == 0 && it.due > today }.shuffled()
                 val future = allCards.filter { it.reps > 0  && it.due > today }.shuffled()
@@ -198,25 +203,36 @@ class ReviewViewModel @Inject constructor(
                 session.addAll(due)
                 if (session.size < limit) session.addAll(newC.take(limit - session.size))
                 if (session.size < limit) session.addAll(future.take(limit - session.size))
-                if (session.isEmpty()) session.addAll(allCards.shuffled())
+                if (session.isEmpty())    session.addAll(allCards.shuffled())
 
-                queue        = ArrayDeque(session.take(limit))
-                totalSession = queue.size
+                sessionCards = session.take(limit)
+                currentIndex = 0
 
-                if (queue.isEmpty()) {
+                if (sessionCards.isEmpty()) {
                     _state.update { it.copy(isLoading = false) }
                     _snack.emit("没有可复习的卡片")
                     return@launch
                 }
 
                 val hm = buildHeatmap()
+                val today2 = LocalDate.now().toString()
                 _state.update { it.copy(
-                    remaining=queue.size, done=0, progress=0f,
-                    heatmap=hm, streak=calcStreak(hm), todayDone=hm[today]?:0
+                    remaining = sessionCards.size,
+                    done      = 0,
+                    progress  = 0f,
+                    heatmap   = hm,
+                    streak    = calcStreak(hm),
+                    todayDone = hm[today2] ?: 0
                 )}
 
-                // Load first card BEFORE switching screens
-                loadCardAndNavigate(dav, isFirst = true)
+                // Load first card content BEFORE navigating to Review
+                val loaded = loadCardContent(dav, currentIndex)
+                if (loaded) {
+                    _screen.value = Screen.Review
+                } else {
+                    _state.update { it.copy(isLoading = false) }
+                    _snack.emit("题目加载失败，请重试")
+                }
 
             } catch (e: Exception) {
                 _state.update { it.copy(isLoading = false) }
@@ -225,51 +241,49 @@ class ReviewViewModel @Inject constructor(
         }
     }
 
-    // Load current card and optionally navigate to Review screen
-    private suspend fun loadCardAndNavigate(dav: WebDavRepository, isFirst: Boolean) {
-        if (queue.isEmpty()) {
-            _state.update { it.copy(isLoading = false) }
-            _screen.value = Screen.Finish
-            return
-        }
-        val card = queue.first()
+    // Returns true if successfully loaded, false otherwise
+    private suspend fun loadCardContent(dav: WebDavRepository, index: Int): Boolean {
+        if (index >= sessionCards.size) return false
+        val card = sessionCards[index]
         _state.update { it.copy(isLoading = true, card = card, parsedCard = null, imageUrls = emptyMap()) }
-        try {
+        return try {
             val content = withContext(Dispatchers.IO) { dav.readFile(card.path) }
             val parsed  = MarkdownParser.parse(content)
             val urlMap  = resolveImages(dav, card.path, parsed)
-            val sm2card = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
-            val prev    = SM2.preview(sm2card)
+            val sm2     = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
+            val prev    = SM2.preview(sm2)
             _state.update { it.copy(
-                card=card, parsedCard=parsed, imageUrls=urlMap, intervals=prev, isLoading=false
+                card       = card,
+                parsedCard = parsed,
+                imageUrls  = urlMap,
+                intervals  = prev,
+                isLoading  = false,
+                remaining  = sessionCards.size - index
             )}
-            if (isFirst) _screen.value = Screen.Review
+            true
         } catch (e: Exception) {
             _state.update { it.copy(isLoading = false) }
-            // Skip failed card and try next
-            queue.removeFirst()
-            if (queue.isNotEmpty()) {
-                loadCardAndNavigate(dav, isFirst)
-            } else {
-                _snack.emit("所有题目加载失败")
-                if (isFirst) _screen.value = Screen.Finish
-            }
+            false
         }
     }
 
     fun grade(grade: Grade) {
-        val card = queue.firstOrNull() ?: return
-        val dav  = webDav ?: run {
+        val dav = webDav ?: run {
             viewModelScope.launch { _snack.emit("连接已断开，请重新登录") }
             return
         }
+        val card = sessionCards.getOrNull(currentIndex) ?: run {
+            viewModelScope.launch { _screen.value = Screen.Finish }
+            return
+        }
+
         viewModelScope.launch {
-            // Save grade result
-            val sm2card = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
-            val result  = SM2.calculate(sm2card, grade)
+            // 1. Save result to DB
+            val sm2    = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
+            val result = SM2.calculate(sm2, grade)
             val updated = card.copy(
-                interval = result.interval, ease = result.ease,
-                reps     = result.reps,     due  = result.due,
+                interval = result.interval, ease   = result.ease,
+                reps     = result.reps,     due    = result.due,
                 lapses   = result.lapses
             )
             withContext(Dispatchers.IO) {
@@ -279,22 +293,38 @@ class ReviewViewModel @Inject constructor(
                 db.cardDao().upsertHeatmap(HeatmapEntity(today, (hm?.count ?: 0) + 1))
             }
 
-            // Update progress
-            queue.removeFirst()
-            val done  = _state.value.done + 1
+            // 2. Advance index
+            currentIndex++
+            val done  = currentIndex
+            val total = sessionCards.size
             val hm    = buildHeatmap()
             val today = LocalDate.now().toString()
             _state.update { it.copy(
-                remaining = queue.size,
                 done      = done,
-                progress  = done.toFloat() / totalSession.coerceAtLeast(1),
+                progress  = done.toFloat() / total.coerceAtLeast(1),
+                remaining = (total - done).coerceAtLeast(0),
                 heatmap   = hm,
                 todayDone = hm[today] ?: 0,
                 streak    = calcStreak(hm)
             )}
 
-            // Load next card (stays on Review screen)
-            loadCardAndNavigate(dav, isFirst = false)
+            // 3. Check if finished
+            if (currentIndex >= sessionCards.size) {
+                _screen.value = Screen.Finish
+                return@launch
+            }
+
+            // 4. Load next card
+            val loaded = loadCardContent(dav, currentIndex)
+            if (!loaded) {
+                // Try skipping to next
+                currentIndex++
+                if (currentIndex >= sessionCards.size) {
+                    _screen.value = Screen.Finish
+                } else {
+                    loadCardContent(dav, currentIndex)
+                }
+            }
         }
     }
 
@@ -314,8 +344,7 @@ class ReviewViewModel @Inject constructor(
                     urlMap[name] = cached
                 } else {
                     try {
-                        val imgPath = dav.resolveImagePath(cardPath, name)
-                        val bytes   = dav.readFileBytes(imgPath)
+                        val bytes = dav.readFileBytes(dav.resolveImagePath(cardPath, name))
                         if (bytes.isNotEmpty()) {
                             val b64  = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
                             val ext  = name.substringAfterLast('.', "jpg").lowercase()
@@ -331,7 +360,7 @@ class ReviewViewModel @Inject constructor(
     }
 
     fun addTag(tag: String) {
-        val card = queue.firstOrNull() ?: return
+        val card = sessionCards.getOrNull(currentIndex) ?: return
         viewModelScope.launch {
             _snack.emit("✅ 已标记：$tag")
             withContext(Dispatchers.IO) {
@@ -360,13 +389,16 @@ class ReviewViewModel @Inject constructor(
     }
 
     fun setDailyLimit(limit: Int) {
-        viewModelScope.launch {
-            savePrefs(_state.value.savedUsername, _state.value.savedPassword, _state.value.savedFolderPath, limit)
-        }
+        viewModelScope.launch { savePrefs(_state.value.savedUsername, _state.value.savedPassword,
+            _state.value.savedFolderPath, limit) }
     }
 
     fun goToFolder()    { _screen.value = Screen.Folder }
-    fun restartReview() { startReview(_state.value.selectedFiles) }
+    fun restartReview() {
+        currentIndex = 0
+        sessionCards = emptyList()
+        startReview(_state.value.selectedFiles)
+    }
 
     private suspend fun buildHeatmap(): Map<String, Int> {
         val from = LocalDate.now().minusDays(29).toString()
@@ -390,7 +422,8 @@ class ReviewViewModel @Inject constructor(
                 prefs[KEY_FOLDER_PATH] = folderPath
                 prefs[KEY_DAILY_LIMIT] = dailyLimit
             }
-            _state.update { it.copy(savedUsername=username, savedPassword=password, savedFolderPath=folderPath, dailyLimit=dailyLimit) }
+            _state.update { it.copy(savedUsername=username, savedPassword=password,
+                savedFolderPath=folderPath, dailyLimit=dailyLimit) }
         }
     }
 }
