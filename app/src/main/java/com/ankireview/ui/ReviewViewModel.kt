@@ -94,7 +94,7 @@ class ReviewViewModel @Inject constructor(
                 savedPassword   = p,
                 savedFolderPath = f,
                 dailyLimit      = d
-            ) }
+            )}
             if (u.isNotBlank() && p.isNotBlank()) {
                 initWebDav(u, p)
                 loadFolder(f)
@@ -143,7 +143,9 @@ class ReviewViewModel @Inject constructor(
         viewModelScope.launch {
             _state.update { it.copy(isLoading = true) }
             try {
-                val items = withContext(Dispatchers.IO) { webDav!!.listFolder(path) }
+                val items = withContext(Dispatchers.IO) {
+                    webDav!!.listFolder(path)
+                }
                 val newStack = if (pushToStack && path != _state.value.currentPath)
                     _state.value.pathStack + _state.value.currentPath
                 else _state.value.pathStack
@@ -152,7 +154,7 @@ class ReviewViewModel @Inject constructor(
                     currentPath = path,
                     pathStack   = newStack,
                     isLoading   = false
-                ) }
+                )}
             } catch (e: Exception) {
                 _state.update { it.copy(isLoading = false) }
                 _snack.emit("加载失败：${e.message}")
@@ -176,34 +178,50 @@ class ReviewViewModel @Inject constructor(
     fun refreshFolder()  = loadFolder(_state.value.currentPath)
 
     // ── Start review ──────────────────────────────
+    // KEY FIX: switch to Review screen ONLY after first card finishes loading
     fun startReview(files: List<WebDavItem>) {
+        // Guard: must have a valid connection
+        val dav = webDav
+        if (dav == null) {
+            viewModelScope.launch { _snack.emit("未连接坚果云，请重新登录") }
+            return
+        }
+        if (files.isEmpty()) {
+            viewModelScope.launch { _snack.emit("此文件夹没有题目文件") }
+            return
+        }
+
         viewModelScope.launch {
             _state.update { it.copy(isLoading = true, selectedFiles = files) }
             try {
                 val today = LocalDate.now().toString()
                 val limit = _state.value.dailyLimit
 
-                // Build cards entirely from the provided file list
+                // Step 1: ensure all files have a DB record (IO thread, explicit loop)
                 val allCards = withContext(Dispatchers.IO) {
-                    files.map { f ->
-                        // Use existing DB record if available, else create a fresh stub
-                        db.cardDao().getCard(f.href)
-                            ?: CardEntity(path = f.href, name = f.name).also { stub ->
-                                db.cardDao().upsertCard(stub)
+                    val result = mutableListOf<CardEntity>()
+                    for (f in files) {
+                        val card = db.cardDao().getCard(f.href)
+                            ?: CardEntity(path = f.href, name = f.name).also {
+                                db.cardDao().upsertCard(it)
                             }
+                        result.add(card)
                     }
+                    result
                 }
 
-                // Bucket into due / new / future
+                // Step 2: bucket cards
                 val due    = allCards.filter { it.due <= today }.shuffled()
-                val new_   = allCards.filter { it.reps == 0 && it.due > today }.shuffled()
+                val newC   = allCards.filter { it.reps == 0 && it.due > today }.shuffled()
                 val future = allCards.filter { it.reps > 0  && it.due > today }.shuffled()
 
-                // Fill up to daily limit
+                // Step 3: build session
                 val session = mutableListOf<CardEntity>()
                 session.addAll(due)
-                if (session.size < limit) session.addAll(new_.take(limit - session.size))
+                if (session.size < limit) session.addAll(newC.take(limit - session.size))
                 if (session.size < limit) session.addAll(future.take(limit - session.size))
+                // If still empty (all cards are new with default due), use all cards
+                if (session.isEmpty()) session.addAll(allCards.shuffled())
 
                 queue        = ArrayDeque(session.take(limit))
                 totalSession = queue.size
@@ -216,81 +234,69 @@ class ReviewViewModel @Inject constructor(
 
                 val hm = buildHeatmap()
                 _state.update { it.copy(
-                    remaining = queue.size, done = 0, progress = 0f,
-                    heatmap   = hm, streak = calcStreak(hm),
-                    todayDone = hm[today] ?: 0, isLoading = false
-                ) }
-                _screen.value = Screen.Review
-                loadNextCard()
+                    remaining = queue.size,
+                    done      = 0,
+                    progress  = 0f,
+                    heatmap   = hm,
+                    streak    = calcStreak(hm),
+                    todayDone = hm[today] ?: 0
+                )}
+
+                // Step 4: load first card content BEFORE switching screen
+                // This prevents ReviewScreen from seeing null parsedCard on first render
+                loadFirstCard(dav)
 
             } catch (e: Exception) {
                 _state.update { it.copy(isLoading = false) }
-                _snack.emit("启动失败：${e.message}")
+                _snack.emit("启动失败：${e.message ?: "未知错误"}")
             }
         }
     }
 
-    private suspend fun loadNextCard() {
-        if (queue.isEmpty()) { _screen.value = Screen.Finish; return }
-        val card = queue.first()
-        _state.update { it.copy(
-            isLoading = true, card = card, parsedCard = null, imageUrls = emptyMap()
-        ) }
-        try {
-            val raw    = withContext(Dispatchers.IO) { webDav!!.readFile(card.path) }
-            val parsed = MarkdownParser.parse(raw)
-
-            val imgNames = (MarkdownParser.extractObsidianImages(parsed.question) +
-                parsed.analysis.flatMap { MarkdownParser.extractObsidianImages(it.body) }).distinct()
-
-            val urlMap = mutableMapOf<String, String>()
-            withContext(Dispatchers.IO) {
-                imgNames.forEach { name ->
-                    imageCache[name]?.let { urlMap[name] = it; return@forEach }
-                    try {
-                        val imgPath = webDav!!.resolveImagePath(card.path, name)
-                        val bytes   = webDav!!.readFileBytes(imgPath)
-                        if (bytes.isNotEmpty()) {
-                            val b64  = android.util.Base64.encodeToString(
-                                bytes, android.util.Base64.NO_WRAP)
-                            val ext  = name.substringAfterLast('.', "jpg").lowercase()
-                            val mime = when(ext) {
-                                "png"  -> "image/png"
-                                "gif"  -> "image/gif"
-                                "webp" -> "image/webp"
-                                else   -> "image/jpeg"
-                            }
-                            val uri = "data:$mime;base64,$b64"
-                            urlMap[name] = uri
-                            imageCache[name] = uri
-                        }
-                    } catch (_: Exception) {}
-                }
-            }
-
-            val sm2  = SM2Card(card.interval, card.ease, card.reps, card.due)
-            val prev = SM2.preview(sm2)
-            _state.update { it.copy(
-                parsedCard = parsed, imageUrls = urlMap,
-                intervals  = prev, isLoading = false
-            ) }
-        } catch (e: Exception) {
+    // Loads first card and then navigates to Review screen
+    private suspend fun loadFirstCard(dav: WebDavRepository) {
+        if (queue.isEmpty()) {
             _state.update { it.copy(isLoading = false) }
-            _snack.emit("加载题目失败：${e.message}")
-            // Skip this card and move to next
+            _screen.value = Screen.Finish
+            return
+        }
+        val card = queue.first()
+        try {
+            val content = withContext(Dispatchers.IO) { dav.readFile(card.path) }
+            val parsed  = MarkdownParser.parse(content)
+            val urlMap  = resolveImages(dav, card.path, parsed)
+            val prev    = SM2.preview(SM2Card(card.interval, card.ease, card.reps, card.due))
+
+            _state.update { it.copy(
+                card       = card,
+                parsedCard = parsed,
+                imageUrls  = urlMap,
+                intervals  = prev,
+                isLoading  = false
+            )}
+            // Navigate to Review only after data is ready
+            _screen.value = Screen.Review
+
+        } catch (e: Exception) {
+            // Failed to load first card - skip and try next
             queue.removeFirst()
-            loadNextCard()
+            if (queue.isNotEmpty()) {
+                loadFirstCard(dav)
+            } else {
+                _state.update { it.copy(isLoading = false) }
+                _snack.emit("所有题目加载失败：${e.message}")
+            }
         }
     }
 
     fun grade(grade: Grade) {
         val card = queue.firstOrNull() ?: return
         viewModelScope.launch {
-            val result  = SM2.calculate(
-                SM2Card(card.interval, card.ease, card.reps, card.due), grade)
+            val result  = SM2.calculate(SM2Card(card.interval, card.ease, card.reps, card.due), grade)
             val updated = card.copy(
                 interval = result.interval, ease = result.ease,
-                reps     = result.reps,     due  = result.due)
+                reps     = result.reps,     due  = result.due
+            )
             withContext(Dispatchers.IO) {
                 db.cardDao().upsertCard(updated)
                 val today = LocalDate.now().toString()
@@ -302,12 +308,76 @@ class ReviewViewModel @Inject constructor(
             val hm    = buildHeatmap()
             val today = LocalDate.now().toString()
             _state.update { it.copy(
-                remaining = queue.size, done = done,
+                remaining = queue.size,
+                done      = done,
                 progress  = done.toFloat() / totalSession.coerceAtLeast(1),
-                heatmap   = hm, todayDone = hm[today] ?: 0, streak = calcStreak(hm)
-            ) }
-            loadNextCard()
+                heatmap   = hm,
+                todayDone = hm[today] ?: 0,
+                streak    = calcStreak(hm)
+            )}
+
+            if (queue.isEmpty()) {
+                _screen.value = Screen.Finish
+                return@launch
+            }
+
+            // Load next card
+            val dav = webDav ?: run { _snack.emit("连接已断开"); return@launch }
+            val next = queue.first()
+            _state.update { it.copy(isLoading = true, card = next, parsedCard = null, imageUrls = emptyMap()) }
+            try {
+                val content = withContext(Dispatchers.IO) { dav.readFile(next.path) }
+                val parsed  = MarkdownParser.parse(content)
+                val urlMap  = resolveImages(dav, next.path, parsed)
+                val prev    = SM2.preview(SM2Card(next.interval, next.ease, next.reps, next.due))
+                _state.update { it.copy(
+                    parsedCard = parsed,
+                    imageUrls  = urlMap,
+                    intervals  = prev,
+                    isLoading  = false
+                )}
+            } catch (e: Exception) {
+                _state.update { it.copy(isLoading = false) }
+                _snack.emit("加载下一题失败，已跳过：${e.message}")
+                queue.removeFirst()
+                if (queue.isEmpty()) _screen.value = Screen.Finish
+            }
         }
+    }
+
+    private suspend fun resolveImages(
+        dav: WebDavRepository,
+        cardPath: String,
+        parsed: ParsedCard
+    ): Map<String, String> {
+        val imgNames = (MarkdownParser.extractObsidianImages(parsed.question) +
+            parsed.analysis.flatMap { MarkdownParser.extractObsidianImages(it.body) }).distinct()
+        if (imgNames.isEmpty()) return emptyMap()
+
+        val urlMap = mutableMapOf<String, String>()
+        withContext(Dispatchers.IO) {
+            for (name in imgNames) {
+                imageCache[name]?.let { urlMap[name] = it; continue }
+                try {
+                    val imgPath = dav.resolveImagePath(cardPath, name)
+                    val bytes   = dav.readFileBytes(imgPath)
+                    if (bytes.isNotEmpty()) {
+                        val b64  = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                        val ext  = name.substringAfterLast('.', "jpg").lowercase()
+                        val mime = when (ext) {
+                            "png"  -> "image/png"
+                            "gif"  -> "image/gif"
+                            "webp" -> "image/webp"
+                            else   -> "image/jpeg"
+                        }
+                        val uri = "data:$mime;base64,$b64"
+                        urlMap[name]     = uri
+                        imageCache[name] = uri
+                    }
+                } catch (_: Exception) { /* image not found, skip */ }
+            }
+        }
+        return urlMap
     }
 
     fun addTag(tag: String) {
@@ -316,9 +386,10 @@ class ReviewViewModel @Inject constructor(
             _snack.emit("✅ 已标记：$tag")
             withContext(Dispatchers.IO) {
                 try {
-                    val raw      = webDav!!.readFile(card.path)
-                    val conflict = mapOf("难" to "易", "易" to "难")[tag]
-                    var content  = raw
+                    val dav     = webDav ?: return@withContext
+                    val raw     = dav.readFile(card.path)
+                    val conflict= mapOf("难" to "易", "易" to "难")[tag]
+                    var content = raw
                     if (content.startsWith("---")) {
                         val end = content.indexOf("\n---", 3)
                         if (end != -1) {
@@ -327,10 +398,7 @@ class ReviewViewModel @Inject constructor(
                                 head = head.replace(Regex("  - \"#?$conflict\"?\n"), "")
                             if (!head.contains("#$tag")) {
                                 head = if (head.contains("tags:"))
-                                    head.replace(
-                                        Regex("(tags:[ \\t]*\\r?\\n)"),
-                                        "$1  - \"#$tag\"\n"
-                                    )
+                                    head.replace(Regex("(tags:[ \\t]*\\r?\\n)"), "$1  - \"#$tag\"\n")
                                 else head + "\ntags:\n  - \"#$tag\""
                             }
                             content = head + content.substring(end)
@@ -338,20 +406,16 @@ class ReviewViewModel @Inject constructor(
                     } else {
                         content = "---\ntags:\n  - \"#$tag\"\n---\n\n$content"
                     }
-                    webDav!!.writeFile(card.path, content)
-                } catch (_: Exception) {}
+                    dav.writeFile(card.path, content)
+                } catch (_: Exception) { }
             }
         }
     }
 
     fun setDailyLimit(limit: Int) {
         viewModelScope.launch {
-            savePrefs(
-                _state.value.savedUsername,
-                _state.value.savedPassword,
-                _state.value.savedFolderPath,
-                limit
-            )
+            savePrefs(_state.value.savedUsername, _state.value.savedPassword,
+                _state.value.savedFolderPath, limit)
         }
     }
 
@@ -374,10 +438,7 @@ class ReviewViewModel @Inject constructor(
         return s
     }
 
-    private fun savePrefs(
-        username: String, password: String,
-        folderPath: String, dailyLimit: Int
-    ) {
+    private fun savePrefs(username: String, password: String, folderPath: String, dailyLimit: Int) {
         viewModelScope.launch {
             ctx.dataStore.edit { prefs ->
                 prefs[KEY_USERNAME]    = username
@@ -390,7 +451,7 @@ class ReviewViewModel @Inject constructor(
                 savedPassword   = password,
                 savedFolderPath = folderPath,
                 dailyLimit      = dailyLimit
-            ) }
+            )}
         }
     }
 }
