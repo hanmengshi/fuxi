@@ -1,0 +1,316 @@
+package com.ankireview.ui
+
+import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.*
+import androidx.datastore.preferences.preferencesDataStore
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.ankireview.api.WebDavItem
+import com.ankireview.api.WebDavRepository
+import com.ankireview.data.AppDatabase
+import com.ankireview.data.CardEntity
+import com.ankireview.data.HeatmapEntity
+import com.ankireview.sm2.Grade
+import com.ankireview.sm2.SM2
+import com.ankireview.sm2.SM2Card
+import com.ankireview.utils.MarkdownParser
+import com.ankireview.utils.ParsedCard
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.time.LocalDate
+import javax.inject.Inject
+
+val Context.dataStore: DataStore<Preferences> by preferencesDataStore("anki_prefs")
+val KEY_USERNAME    = stringPreferencesKey("username")
+val KEY_PASSWORD    = stringPreferencesKey("password")
+val KEY_FOLDER_PATH = stringPreferencesKey("folder_path")
+
+sealed class Screen { object Login : Screen(); object Folder : Screen(); object Review : Screen(); object Finish : Screen() }
+
+data class ReviewUiState(
+    val isLoading: Boolean         = false,
+    val error: String?             = null,
+    val savedUsername: String      = "",
+    val savedPassword: String      = "",
+    val savedFolderPath: String    = "",
+    val folderItems: List<WebDavItem> = emptyList(),
+    val currentPath: String        = "",
+    val selectedFiles: List<WebDavItem> = emptyList(),
+    val card: CardEntity?          = null,
+    val parsedCard: ParsedCard?    = null,
+    val imageUrls: Map<String, String> = emptyMap(),
+    val intervals: Map<Grade, Int> = emptyMap(),
+    val remaining: Int             = 0,
+    val done: Int                  = 0,
+    val progress: Float            = 0f,
+    val heatmap: Map<String, Int>  = emptyMap(),
+    val dueCount: Int              = 0,
+    val streak: Int                = 0,
+    val todayDone: Int             = 0
+)
+
+@HiltViewModel
+class ReviewViewModel @Inject constructor(
+    @ApplicationContext private val ctx: Context,
+    private val db: AppDatabase
+) : ViewModel() {
+
+    private val _state  = MutableStateFlow(ReviewUiState())
+    val state: StateFlow<ReviewUiState> = _state.asStateFlow()
+
+    private val _screen = MutableStateFlow<Screen>(Screen.Login)
+    val screen: StateFlow<Screen> = _screen.asStateFlow()
+
+    private val _snack  = MutableSharedFlow<String>()
+    val snack: SharedFlow<String> = _snack.asSharedFlow()
+
+    private var webDav: WebDavRepository? = null
+    private var queue: ArrayDeque<CardEntity> = ArrayDeque()
+    private var totalSession = 0
+
+    // Image cache: name → data URI (base64 encoded for Markwon)
+    private val imageCache = mutableMapOf<String, String>()
+
+    init {
+        viewModelScope.launch {
+            val prefs = ctx.dataStore.data.first()
+            _state.update { it.copy(
+                savedUsername   = prefs[KEY_USERNAME]    ?: "",
+                savedPassword   = prefs[KEY_PASSWORD]    ?: "",
+                savedFolderPath = prefs[KEY_FOLDER_PATH] ?: ""
+            ) }
+            // Auto-restore if credentials saved
+            if ((prefs[KEY_USERNAME] ?: "").isNotBlank() && (prefs[KEY_PASSWORD] ?: "").isNotBlank()) {
+                initWebDav(prefs[KEY_USERNAME]!!, prefs[KEY_PASSWORD]!!)
+                loadFolder(prefs[KEY_FOLDER_PATH] ?: "")
+                _screen.value = Screen.Folder
+            }
+            db.cardDao().getDueCount(LocalDate.now().toString()).collect { cnt ->
+                _state.update { it.copy(dueCount = cnt) }
+            }
+        }
+    }
+
+    // ── Auth ──────────────────────────────────────
+    fun connect(username: String, password: String, folderPath: String) {
+        viewModelScope.launch {
+            _state.update { it.copy(isLoading = true, error = null) }
+            try {
+                initWebDav(username, password)
+                val ok = webDav!!.testConnection()
+                if (!ok) throw Exception("账号或密码错误，请检查后重试")
+                savePrefs(username, password, folderPath)
+                loadFolder(folderPath)
+                _screen.value = Screen.Folder
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message) }
+                _snack.emit("连接失败：${e.message}")
+            } finally {
+                _state.update { it.copy(isLoading = false) }
+            }
+        }
+    }
+
+    fun disconnect() {
+        viewModelScope.launch {
+            ctx.dataStore.edit { it.clear() }
+            webDav = null
+            _state.value = ReviewUiState()
+            _screen.value = Screen.Login
+        }
+    }
+
+    private fun initWebDav(username: String, password: String) {
+        webDav = WebDavRepository(WebDavRepository.JIANGUOYUN_URL, username, password)
+    }
+
+    // ── Folder navigation ─────────────────────────
+    fun loadFolder(path: String) {
+        viewModelScope.launch {
+            _state.update { it.copy(isLoading = true) }
+            try {
+                val items = withContext(Dispatchers.IO) { webDav!!.listFolder(path) }
+                _state.update { it.copy(folderItems = items, currentPath = path) }
+            } catch (e: Exception) {
+                _snack.emit("加载失败：${e.message}")
+            } finally {
+                _state.update { it.copy(isLoading = false) }
+            }
+        }
+    }
+
+    fun selectAndStartReview(files: List<WebDavItem>, folderPath: String) {
+        viewModelScope.launch {
+            savePrefs(_state.value.savedUsername, _state.value.savedPassword, folderPath)
+        }
+        _state.update { it.copy(selectedFiles = files) }
+        startReview(files)
+    }
+
+    // ── Review ────────────────────────────────────
+    private fun startReview(files: List<WebDavItem>) {
+        viewModelScope.launch {
+            _state.update { it.copy(isLoading = true) }
+            try {
+                val today = LocalDate.now().toString()
+                // Upsert stubs for new files
+                files.forEach { f ->
+                    if (db.cardDao().getCard(f.href) == null)
+                        db.cardDao().upsertCard(CardEntity(path = f.href, name = f.name))
+                }
+                val due    = db.cardDao().getDueCards(today)
+                val new_   = db.cardDao().getNewCards(maxOf(0, 20 - due.size))
+                val future = if (due.size + new_.size < 20)
+                    db.cardDao().getFutureCards(today, 20 - due.size - new_.size)
+                else emptyList()
+
+                queue        = ArrayDeque((due + new_ + future).take(20).shuffled())
+                totalSession = queue.size
+
+                val hm = buildHeatmap()
+                _state.update { it.copy(
+                    remaining = queue.size, done = 0, progress = 0f,
+                    heatmap = hm, streak = calcStreak(hm),
+                    todayDone = hm[today] ?: 0
+                ) }
+                _screen.value = Screen.Review
+                loadNextCard()
+            } catch (e: Exception) {
+                _snack.emit("启动失败：${e.message}")
+            } finally {
+                _state.update { it.copy(isLoading = false) }
+            }
+        }
+    }
+
+    private suspend fun loadNextCard() {
+        if (queue.isEmpty()) { _screen.value = Screen.Finish; return }
+        val card = queue.first()
+        _state.update { it.copy(isLoading = true, card = card, parsedCard = null, imageUrls = emptyMap()) }
+        try {
+            val raw    = withContext(Dispatchers.IO) { webDav!!.readFile(card.path) }
+            val parsed = MarkdownParser.parse(raw)
+
+            // Resolve images
+            val imgNames = (MarkdownParser.extractObsidianImages(parsed.question) +
+                parsed.analysis.flatMap { MarkdownParser.extractObsidianImages(it.body) }).distinct()
+
+            val urlMap = mutableMapOf<String, String>()
+            withContext(Dispatchers.IO) {
+                imgNames.forEach { name ->
+                    val cached = imageCache[name]
+                    if (cached != null) { urlMap[name] = cached; return@forEach }
+                    try {
+                        val imgPath = webDav!!.resolveImagePath(card.path, name)
+                        val bytes   = webDav!!.readFileBytes(imgPath)
+                        if (bytes.isNotEmpty()) {
+                            val b64  = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                            val ext  = name.substringAfterLast('.', "jpg").lowercase()
+                            val mime = when(ext) { "png"->"image/png"; "gif"->"image/gif"; "webp"->"image/webp"; else->"image/jpeg" }
+                            val uri  = "data:$mime;base64,$b64"
+                            urlMap[name]      = uri
+                            imageCache[name]  = uri
+                        }
+                    } catch (e: Exception) { /* image not found, skip */ }
+                }
+            }
+
+            val sm2   = SM2Card(card.interval, card.ease, card.reps, card.due)
+            val prev  = SM2.preview(sm2)
+            _state.update { it.copy(parsedCard = parsed, imageUrls = urlMap, intervals = prev, isLoading = false) }
+        } catch (e: Exception) {
+            _state.update { it.copy(isLoading = false) }
+            _snack.emit("加载题目失败：${e.message}")
+        }
+    }
+
+    fun grade(grade: Grade) {
+        val card = queue.firstOrNull() ?: return
+        viewModelScope.launch {
+            val result  = SM2.calculate(SM2Card(card.interval, card.ease, card.reps, card.due), grade)
+            val updated = card.copy(interval = result.interval, ease = result.ease, reps = result.reps, due = result.due)
+            withContext(Dispatchers.IO) {
+                db.cardDao().upsertCard(updated)
+                val today = LocalDate.now().toString()
+                val hm    = db.cardDao().getHeatmap(today)
+                db.cardDao().upsertHeatmap(HeatmapEntity(today, (hm?.count ?: 0) + 1))
+            }
+            queue.removeFirst()
+            val done  = _state.value.done + 1
+            val hm    = buildHeatmap()
+            val today = LocalDate.now().toString()
+            _state.update { it.copy(
+                remaining = queue.size, done = done,
+                progress  = done.toFloat() / totalSession.coerceAtLeast(1),
+                heatmap   = hm, todayDone = hm[today] ?: 0, streak = calcStreak(hm)
+            ) }
+            loadNextCard()
+        }
+    }
+
+    fun addTag(tag: String) {
+        val card = queue.firstOrNull() ?: return
+        viewModelScope.launch {
+            _snack.emit("✅ 已标记：$tag")
+            withContext(Dispatchers.IO) {
+                try {
+                    val raw     = webDav!!.readFile(card.path)
+                    val mutex   = mapOf("难" to "易", "易" to "难")
+                    val conflict= mutex[tag]
+                    var content = raw
+                    if (content.startsWith("---")) {
+                        val end = content.indexOf("\n---", 3)
+                        if (end != -1) {
+                            var head = content.substring(0, end)
+                            if (conflict != null) head = head.replace(Regex("  - \"#?$conflict\"?\n"), "")
+                            if (!head.contains("#$tag")) {
+                                head = if (head.contains("tags:"))
+                                    head.replace(Regex("(tags:[ \\t]*\\r?\\n)"), "$1  - \"#$tag\"\n")
+                                else head + "\ntags:\n  - \"#$tag\""
+                            }
+                            content = head + content.substring(end)
+                        }
+                    } else {
+                        content = "---\ntags:\n  - \"#$tag\"\n---\n\n$content"
+                    }
+                    webDav!!.writeFile(card.path, content)
+                } catch (e: Exception) { /* silent */ }
+            }
+        }
+    }
+
+    fun goToFolder() { _screen.value = Screen.Folder }
+    fun restartReview() { startReview(_state.value.selectedFiles) }
+
+    private suspend fun buildHeatmap(): Map<String, Int> {
+        val from = LocalDate.now().minusDays(29).toString()
+        return withContext(Dispatchers.IO) {
+            db.cardDao().getHeatmapRange(from).associate { it.date to it.count }
+        }
+    }
+
+    private fun calcStreak(hm: Map<String, Int>): Int {
+        var s = 0
+        for (i in 0..364) {
+            val d = LocalDate.now().minusDays(i.toLong()).toString()
+            if ((hm[d] ?: 0) > 0) s++ else if (i > 0) break
+        }
+        return s
+    }
+
+    private fun savePrefs(username: String, password: String, folderPath: String) {
+        viewModelScope.launch {
+            ctx.dataStore.edit { prefs ->
+                prefs[KEY_USERNAME]    = username
+                prefs[KEY_PASSWORD]    = password
+                prefs[KEY_FOLDER_PATH] = folderPath
+            }
+            _state.update { it.copy(savedUsername = username, savedPassword = password, savedFolderPath = folderPath) }
+        }
+    }
+}

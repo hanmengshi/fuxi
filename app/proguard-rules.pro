@@ -1,0 +1,5 @@
+-keep class io.noties.markwon.** { *; }
+-keep class okhttp3.** { *; }
+-dontwarn okhttp3.**
+-keep class kotlin.** { *; }
+-keep class dagger.** { *; }
