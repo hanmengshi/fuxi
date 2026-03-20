@@ -208,7 +208,7 @@ private fun DailyLimitDialog(
     onConfirm: (Int) -> Unit,
     onDismiss: () -> Unit
 ) {
-    val options = listOf(10, 20, 30, 50, 100)
+    val options = listOf(5, 10, 15, 20)
     var selected by remember { mutableIntStateOf(current) }
 
     AlertDialog(
