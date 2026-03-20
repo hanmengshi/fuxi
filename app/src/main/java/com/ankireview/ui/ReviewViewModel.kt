@@ -353,3 +353,92 @@ class ReviewViewModel @Inject constructor(
     }
 
 
+
+    private suspend fun safeResolveImages(
+        dav: WebDavRepository, cardPath: String, parsed: ParsedCard
+    ): Map<String, String> {
+        val names = (MarkdownParser.extractObsidianImages(parsed.question) +
+            parsed.analysis.flatMap { MarkdownParser.extractObsidianImages(it.body) }).distinct()
+        if (names.isEmpty()) return emptyMap()
+        val map = mutableMapOf<String, String>()
+        withContext(Dispatchers.IO) {
+            for (name in names) {
+                val cached = imageCache[name]
+                if (cached != null) { map[name] = cached; continue }
+                try {
+                    val bytes = dav.readFileBytes(dav.resolveImagePath(cardPath, name))
+                    if (bytes.isNotEmpty()) {
+                        val b64  = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                        val ext  = name.substringAfterLast(".").lowercase()
+                        val mime = when(ext) { "png"->"image/png";"gif"->"image/gif";"webp"->"image/webp";else->"image/jpeg" }
+                        val uri  = "data:$mime;base64,$b64"
+                        map[name] = uri; imageCache[name] = uri
+                    }
+                } catch (_: Exception) { }
+            }
+        }
+        return map
+    }
+
+    fun addTag(tag: String) {
+        val idx  = currentIndex
+        val card = sessionCards.getOrNull(idx) ?: return
+        viewModelScope.launch(exHandler) {
+            _snack.emit("✅ 已标记：$tag")
+            withContext(Dispatchers.IO) {
+                try {
+                    val dav = webDav ?: return@withContext
+                    val raw = dav.readFile(card.path)
+                    val conflict = mapOf("难" to "易", "易" to "难")[tag]
+                    var content = raw
+                    if (content.startsWith("---")) {
+                        val end = content.indexOf("\n---", 3)
+                        if (end != -1) {
+                            var head = content.substring(0, end)
+                            if (conflict != null) head = head.replace(Regex("  - \"#?$conflict\"?\n"), "")
+                            if (!head.contains("#$tag")) {
+                                head = if (head.contains("tags:"))
+                                    head.replace(Regex("(tags:[ \\t]*\\r?\\n)"), "$1  - \"#$tag\"\n")
+                                else head + "\ntags:\n  - \"#$tag\""
+                            }
+                            content = head + content.substring(end)
+                        }
+                    } else content = "---\ntags:\n  - \"#$tag\"\n---\n\n$content"
+                    dav.writeFile(card.path, content)
+                } catch (e: Exception) { Log.e(TAG, "addTag failed", e) }
+            }
+        }
+    }
+
+    fun setDailyLimit(limit: Int) {
+        viewModelScope.launch(exHandler) {
+            savePrefs(_state.value.savedUsername, _state.value.savedPassword,
+                _state.value.savedFolderPath, limit)
+        }
+    }
+
+    fun goToFolder()    { _screen.value = Screen.Folder }
+    fun restartReview() { currentIndex = 0; sessionCards = emptyList(); startReview(_state.value.selectedFiles) }
+
+    private suspend fun buildHeatmap(): Map<String, Int> {
+        val from = LocalDate.now().minusDays(29).toString()
+        return withContext(Dispatchers.IO) { db.cardDao().getHeatmapRange(from).associate { it.date to it.count } }
+    }
+
+    private fun calcStreak(hm: Map<String, Int>): Int {
+        var s = 0
+        for (i in 0..364) {
+            if ((hm[LocalDate.now().minusDays(i.toLong()).toString()] ?: 0) > 0) s++ else if (i > 0) break
+        }
+        return s
+    }
+
+    private fun savePrefs(u: String, p: String, f: String, d: Int) {
+        viewModelScope.launch(exHandler) {
+            ctx.dataStore.edit { prefs ->
+                prefs[KEY_USERNAME]=u; prefs[KEY_PASSWORD]=p; prefs[KEY_FOLDER_PATH]=f; prefs[KEY_DAILY_LIMIT]=d
+            }
+            _state.update { it.copy(savedUsername=u, savedPassword=p, savedFolderPath=f, dailyLimit=d) }
+        }
+    }
+}
