@@ -1,6 +1,8 @@
 package com.ankireview.data
 
 import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName = "cards")
@@ -41,9 +43,16 @@ interface CardDao {
     suspend fun upsertHeatmap(h: HeatmapEntity)
 }
 
+// Migration from v1 (no lapses) to v2 (with lapses column)
+val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE cards ADD COLUMN lapses INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
 @Database(
-    entities = [CardEntity::class, HeatmapEntity::class],
-    version  = 2,
+    entities    = [CardEntity::class, HeatmapEntity::class],
+    version     = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
