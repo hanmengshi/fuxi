@@ -1,6 +1,7 @@
 package com.ankireview.ui.review
 
 import android.text.method.LinkMovementMethod
+import android.text.util.Linkify
 import android.widget.TextView
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
@@ -46,12 +47,25 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
     val THRESHOLD    = 180f
     val snackState   = remember { SnackbarHostState() }
 
+    // Markwon with inline LaTeX ($...$) and block LaTeX ($$...$$)
     val markwon = remember {
-        Markwon.builder(context)
-            .usePlugin(HtmlPlugin.create())
-            .usePlugin(ImagesPlugin.create())
-            .usePlugin(JLatexMathPlugin.create(48f))  // LaTeX math rendering
-            .build()
+        try {
+            Markwon.builder(context)
+                .usePlugin(HtmlPlugin.create())
+                .usePlugin(ImagesPlugin.create())
+                .usePlugin(
+                    JLatexMathPlugin.create(46f) { builder ->
+                        builder.inlinesEnabled(true)
+                    }
+                )
+                .build()
+        } catch (e: Exception) {
+            // Fallback without LaTeX if init fails
+            Markwon.builder(context)
+                .usePlugin(HtmlPlugin.create())
+                .usePlugin(ImagesPlugin.create())
+                .build()
+        }
     }
 
     LaunchedEffect(state.card?.path) { analysisOpen = false; swipeDx = 0f }
@@ -62,11 +76,9 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
         topBar = {
             TopAppBar(
                 title = {
-                    Text(
-                        state.card?.name?.removeSuffix(".md") ?: "",
+                    Text(state.card?.name?.removeSuffix(".md") ?: "",
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        fontSize = 15.sp, fontWeight = FontWeight.SemiBold
-                    )
+                        fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                 },
                 navigationIcon = {
                     IconButton(onClick = { viewModel.goToFolder() }) {
@@ -107,7 +119,7 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
 
                 val parsed = state.parsedCard ?: return@Column
 
-                // Question card with swipe
+                // Question card with swipe gesture
                 Box(Modifier.padding(16.dp).pointerInput(Unit) {
                     detectHorizontalDragGestures(
                         onDragEnd = {
@@ -149,11 +161,11 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                                     }
                                 }
                             }
-                            MarkdownView(
-                                markdown   = MarkdownParser.normalizeImages(parsed.question, state.imageUrls),
-                                markwon    = markwon,
-                                modifier   = Modifier.fillMaxWidth(),
-                                textSizeSp = 18f
+                            MathText(
+                                text     = MarkdownParser.normalizeImages(parsed.question, state.imageUrls),
+                                markwon  = markwon,
+                                modifier = Modifier.fillMaxWidth(),
+                                textSize = 18f
                             )
                         }
                     }
@@ -174,7 +186,7 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                     }
                 }
 
-                // Analysis
+                // Analysis section
                 if (parsed.analysis.isNotEmpty()) {
                     val rotation by animateFloatAsState(if (analysisOpen) 180f else 0f, label = "arr")
                     OutlinedCard(
@@ -212,18 +224,17 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                                     Spacer(Modifier.height(8.dp))
                                     if (section.type == SectionType.KNOWLEDGE_POINTS) {
                                         section.body.split('\n')
-                                            .map { it.trimStart('-','*',' ') }
-                                            .filter { it.isNotBlank() }
+                                            .map { it.trimStart('-','*',' ') }.filter { it.isNotBlank() }
                                             .forEach { kp ->
                                                 SuggestionChip({}, { Text(kp, fontWeight = FontWeight.Bold) },
                                                     Modifier.padding(end = 4.dp, bottom = 4.dp))
                                             }
                                     } else {
-                                        MarkdownView(
-                                            markdown   = MarkdownParser.normalizeImages(section.body, state.imageUrls),
-                                            markwon    = markwon,
-                                            modifier   = Modifier.fillMaxWidth(),
-                                            textSizeSp = 16f
+                                        MathText(
+                                            text     = MarkdownParser.normalizeImages(section.body, state.imageUrls),
+                                            markwon  = markwon,
+                                            modifier = Modifier.fillMaxWidth(),
+                                            textSize = 16f
                                         )
                                     }
                                 }
@@ -237,6 +248,7 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
     }
 }
 
+// ── Grade buttons ─────────────────────────────────
 @Composable
 private fun GradeButtons(state: ReviewUiState, viewModel: ReviewViewModel) {
     Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
@@ -267,91 +279,71 @@ private fun GradeButtons(state: ReviewUiState, viewModel: ReviewViewModel) {
     }
 }
 
+// ── Markdown + LaTeX renderer ─────────────────────
 @Composable
-fun MarkdownView(
-    markdown: String,
+fun MathText(
+    text: String,
     markwon: Markwon,
     modifier: Modifier = Modifier,
-    textSizeSp: Float = 17f
+    textSize: Float = 17f
 ) {
     AndroidView(
         modifier = modifier,
         factory  = { ctx ->
             TextView(ctx).apply {
                 movementMethod = LinkMovementMethod.getInstance()
-                textSize = textSizeSp
-                setLineSpacing(4f, 1.25f)
+                this.textSize = textSize
+                setLineSpacing(4f, 1.3f)
             }
         },
         update = { tv ->
-            tv.textSize = textSizeSp
-            markwon.setMarkdown(tv, markdown)
+            tv.textSize = textSize
+            markwon.setMarkdown(tv, text)
         }
     )
 }
 
+// ── Heatmap ───────────────────────────────────────
 @Composable
 private fun HeatmapStrip(heatmap: Map<String, Int>) {
     val today = java.time.LocalDate.now()
-    Column(Modifier.fillMaxWidth()
-        .background(MaterialTheme.colorScheme.surface)
-        .padding(14.dp, 10.dp)) {
+    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(14.dp, 10.dp)) {
         Text("近30天活跃度", fontSize = 10.sp, fontWeight = FontWeight.Bold,
             letterSpacing = 0.8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(6.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             (29 downTo 0).forEach { i ->
-                val date  = today.minusDays(i.toLong()).toString()
-                val count = heatmap[date] ?: 0
-                val color = when {
-                    count == 0  -> MaterialTheme.colorScheme.surfaceVariant
-                    count <= 5  -> Color(0xFF78E08F)
-                    count <= 10 -> Color(0xFF38ADA9)
-                    else        -> Color(0xFF079992)
-                }
-                Box(
-                    Modifier.weight(1f).aspectRatio(1f)
-                        .clip(RoundedCornerShape(2.dp))
-                        .background(color)
-                        .then(if (i == 0) Modifier.border(
-                            1.5.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp)
-                        ) else Modifier)
-                )
+                val cnt   = heatmap[today.minusDays(i.toLong()).toString()] ?: 0
+                val color = when { cnt == 0 -> MaterialTheme.colorScheme.surfaceVariant; cnt <= 5 -> Color(0xFF78E08F); cnt <= 10 -> Color(0xFF38ADA9); else -> Color(0xFF079992) }
+                Box(Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(2.dp)).background(color)
+                    .then(if (i == 0) Modifier.border(1.5.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp)) else Modifier))
             }
         }
     }
 }
 
+// ── Stats ─────────────────────────────────────────
 @Composable
 private fun StatsRow(state: ReviewUiState) {
-    val cardStatus = state.card?.let { card ->
-        val sm2 = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
-        SM2.retentionLabel(sm2)
-    } ?: ""
-
+    val label = state.card?.let { SM2.retentionLabel(SM2Card(it.interval, it.ease, it.reps, it.due, it.lapses)) } ?: ""
     Row(Modifier.padding(14.dp, 8.dp, 14.dp, 0.dp).fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        listOf(
-            "${state.done}"      to "已完成",
-            "${state.dueCount}"  to "今日到期",
-            "${state.streak}天"  to "连续复习"
-        ).forEach { (num, label) ->
+        listOf("${state.done}" to "已完成", "${state.dueCount}" to "今日到期", "${state.streak}天" to "连续").forEach { (num, lbl) ->
             Card(Modifier.weight(1f), shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
                 Column(Modifier.padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(num, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold,
-                        color = MaterialTheme.colorScheme.primary)
-                    Text(label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(num, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.primary)
+                    Text(lbl, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
-        if (cardStatus.isNotBlank()) {
+        if (label.isNotBlank()) {
             Card(Modifier.weight(1f), shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
                 Column(Modifier.padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(cardStatus, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold,
+                    Text(label, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold,
                         color = MaterialTheme.colorScheme.tertiary, maxLines = 1)
-                    Text("卡片状态", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("状态", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
