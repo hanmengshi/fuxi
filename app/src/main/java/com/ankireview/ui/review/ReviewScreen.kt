@@ -3,12 +3,10 @@ package com.ankireview.ui.review
 import android.graphics.BitmapFactory
 import android.text.method.LinkMovementMethod
 import android.util.Base64
-import android.widget.ImageView
 import android.widget.TextView
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -20,7 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -31,7 +29,6 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import coil.compose.AsyncImage
 import com.ankireview.sm2.Grade
 import com.ankireview.sm2.SM2
 import com.ankireview.sm2.SM2Card
@@ -39,14 +36,9 @@ import com.ankireview.ui.ReviewUiState
 import com.ankireview.ui.ReviewViewModel
 import com.ankireview.utils.MarkdownParser
 import com.ankireview.utils.SectionType
-import io.noties.markwon.AbstractMarkwonPlugin
 import io.noties.markwon.Markwon
-import io.noties.markwon.MarkwonVisitor
-import io.noties.markwon.ext.latex.JLatexMathPlugin
 import io.noties.markwon.html.HtmlPlugin
-import io.noties.markwon.image.AsyncDrawable
 import io.noties.markwon.image.ImagesPlugin
-import io.noties.markwon.image.ImageSize
 import kotlin.math.abs
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -58,31 +50,22 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
     var swipeDx      by remember { mutableStateOf(0f) }
     val THRESHOLD    = 180f
     val snackState   = remember { SnackbarHostState() }
-
-    // Lightbox state
     var lightboxUrl  by remember { mutableStateOf<String?>(null) }
 
+    // Simple Markwon — NO LaTeX plugin needed, math is pre-converted to Unicode
     val markwon = remember {
-        try {
-            Markwon.builder(context)
-                .usePlugin(HtmlPlugin.create())
-                .usePlugin(ImagesPlugin.create())
-                .usePlugin(JLatexMathPlugin.create(46f) { b -> b.inlinesEnabled(true) })
-                .build()
-        } catch (_: Exception) {
-            Markwon.builder(context)
-                .usePlugin(HtmlPlugin.create())
-                .usePlugin(ImagesPlugin.create())
-                .build()
-        }
+        Markwon.builder(context)
+            .usePlugin(HtmlPlugin.create())
+            .usePlugin(ImagesPlugin.create())
+            .build()
     }
 
     LaunchedEffect(state.card?.path) { analysisOpen = false; swipeDx = 0f }
     LaunchedEffect(Unit) { viewModel.snack.collect { snackState.showSnackbar(it) } }
 
-    // Lightbox dialog
+    // Lightbox
     lightboxUrl?.let { url ->
-        ImageLightbox(url = url, onDismiss = { lightboxUrl = null })
+        ImageLightboxDialog(url = url, onDismiss = { lightboxUrl = null })
     }
 
     Scaffold(
@@ -94,16 +77,22 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
                         fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                 },
-                navigationIcon = { IconButton(onClick = { viewModel.goToFolder() }) { Icon(Icons.Default.ArrowBack, "返回") } },
+                navigationIcon = {
+                    IconButton(onClick = { viewModel.goToFolder() }) {
+                        Icon(Icons.Default.ArrowBack, "返回")
+                    }
+                },
                 actions = {
                     Text("${state.remaining} 剩", Modifier.padding(end = 16.dp),
-                        color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Bold, fontSize = 14.sp)
                 }
             )
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            LinearProgressIndicator(progress = state.progress, Modifier.fillMaxWidth(),
+            LinearProgressIndicator(progress = state.progress,
+                modifier = Modifier.fillMaxWidth(),
                 color = MaterialTheme.colorScheme.primary)
 
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
@@ -123,7 +112,7 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
 
                 val parsed = state.parsedCard ?: return@Column
 
-                // ── Question card ──────────────────────────────
+                // ── Question card ─────────────────────────────
                 Box(Modifier.padding(16.dp).pointerInput(Unit) {
                     detectHorizontalDragGestures(
                         onDragEnd = {
@@ -151,84 +140,100 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                                     horizontalArrangement = Arrangement.SpaceBetween) {
                                     if (swipeDx < 0) {
                                         Box(Modifier.clip(RoundedCornerShape(20.dp))
-                                            .background(Color(0xFFB3261E).copy(alpha=alpha)).padding(10.dp,5.dp)) {
-                                            Text("← 重来", color=Color.White, fontWeight=FontWeight.Bold)
+                                            .background(Color(0xFFB3261E).copy(alpha = alpha))
+                                            .padding(10.dp, 5.dp)) {
+                                            Text("← 重来", color = Color.White, fontWeight = FontWeight.Bold)
                                         }
                                     } else Spacer(Modifier.size(1.dp))
                                     if (swipeDx > 0) {
                                         Box(Modifier.clip(RoundedCornerShape(20.dp))
-                                            .background(Color(0xFF1565C0).copy(alpha=alpha)).padding(10.dp,5.dp)) {
-                                            Text("简单 →", color=Color.White, fontWeight=FontWeight.Bold)
+                                            .background(Color(0xFF1565C0).copy(alpha = alpha))
+                                            .padding(10.dp, 5.dp)) {
+                                            Text("简单 →", color = Color.White, fontWeight = FontWeight.Bold)
                                         }
                                     }
                                 }
                             }
-                            // Render question: preprocess LaTeX then use Markwon
-                            val questionMd = MarkdownParser.preprocessLatex(
+                            // Convert math to Unicode, then render as Markdown
+                            val questionText = MarkdownParser.renderMath(
                                 MarkdownParser.normalizeImages(parsed.question, state.imageUrls)
                             )
-                            MathMarkdownView(
-                                text     = questionMd,
-                                markwon  = markwon,
-                                modifier = Modifier.fillMaxWidth(),
-                                textSize = 18f,
-                                onImageClick = { url -> lightboxUrl = url }
+                            MarkdownTextView(
+                                text       = questionText,
+                                markwon    = markwon,
+                                modifier   = Modifier.fillMaxWidth(),
+                                textSize   = 18f,
+                                onImageUrl = { url -> lightboxUrl = url }
                             )
                         }
                     }
                 }
 
-                // ── Grade buttons ──────────────────────────────
+                // ── Grade buttons ─────────────────────────────
                 GradeButtons(state, viewModel)
 
-                // ── Tag chips ──────────────────────────────────
-                Row(Modifier.padding(16.dp,4.dp,16.dp,8.dp).fillMaxWidth(),
+                // ── Tag chips ─────────────────────────────────
+                Row(Modifier.padding(16.dp, 4.dp, 16.dp, 8.dp).fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceEvenly) {
-                    listOf("难" to "🔥","易" to "🍃","易错" to "⚠️","重点" to "⭐").forEach { (tag,icon) ->
-                        OutlinedButton(onClick={viewModel.addTag(tag)}, shape=RoundedCornerShape(20.dp),
-                            modifier=Modifier.height(44.dp), contentPadding=PaddingValues(horizontal=14.dp)) {
-                            Text("$icon $tag", fontSize=14.sp, fontWeight=FontWeight.Bold)
-                        }
+                    listOf("难" to "🔥", "易" to "🍃", "易错" to "⚠️", "重点" to "⭐").forEach { (tag, icon) ->
+                        OutlinedButton(
+                            onClick = { viewModel.addTag(tag) },
+                            shape = RoundedCornerShape(20.dp),
+                            modifier = Modifier.height(44.dp),
+                            contentPadding = PaddingValues(horizontal = 14.dp)
+                        ) { Text("$icon $tag", fontSize = 14.sp, fontWeight = FontWeight.Bold) }
                     }
                 }
 
-                // ── Analysis ───────────────────────────────────
+                // ── Analysis ──────────────────────────────────
                 if (parsed.analysis.isNotEmpty()) {
-                    val rotation by animateFloatAsState(if (analysisOpen) 180f else 0f, label="arr")
-                    OutlinedCard(Modifier.fillMaxWidth().padding(16.dp,4.dp).clickable { analysisOpen=!analysisOpen },
-                        shape=RoundedCornerShape(16.dp)) {
-                        Row(Modifier.padding(16.dp,14.dp), verticalAlignment=Alignment.CenterVertically) {
-                            Text("💡 查看详细解析", fontWeight=FontWeight.Bold,
-                                color=MaterialTheme.colorScheme.primary, modifier=Modifier.weight(1f))
-                            Icon(Icons.Default.ExpandMore, null, Modifier.rotate(rotation), tint=MaterialTheme.colorScheme.primary)
+                    val rotation by animateFloatAsState(if (analysisOpen) 180f else 0f, label = "arr")
+                    OutlinedCard(
+                        Modifier.fillMaxWidth().padding(16.dp, 4.dp)
+                            .clickable { analysisOpen = !analysisOpen },
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Row(Modifier.padding(16.dp, 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("💡 查看详细解析", fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
+                            Icon(Icons.Default.ExpandMore, null, Modifier.rotate(rotation),
+                                tint = MaterialTheme.colorScheme.primary)
                         }
                     }
                     if (analysisOpen) {
                         parsed.analysis.forEach { section ->
-                            Card(Modifier.fillMaxWidth().padding(horizontal=16.dp,vertical=4.dp),
-                                shape=RoundedCornerShape(16.dp),
-                                colors=CardDefaults.cardColors(containerColor=
-                                    if(section.type==SectionType.SUMMARY) MaterialTheme.colorScheme.tertiaryContainer
-                                    else MaterialTheme.colorScheme.surfaceVariant)) {
+                            Card(
+                                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                                shape = RoundedCornerShape(16.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (section.type == SectionType.SUMMARY)
+                                        MaterialTheme.colorScheme.tertiaryContainer
+                                    else MaterialTheme.colorScheme.surfaceVariant
+                                )
+                            ) {
                                 Column(Modifier.padding(16.dp)) {
-                                    Row(verticalAlignment=Alignment.CenterVertically) {
-                                        Box(Modifier.width(3.dp).height(15.dp).clip(RoundedCornerShape(2.dp))
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Box(Modifier.width(3.dp).height(15.dp)
+                                            .clip(RoundedCornerShape(2.dp))
                                             .background(MaterialTheme.colorScheme.primary))
                                         Spacer(Modifier.width(8.dp))
-                                        Text(section.title, fontWeight=FontWeight.ExtraBold,
-                                            fontSize=11.sp, color=MaterialTheme.colorScheme.secondary)
+                                        Text(section.title, fontWeight = FontWeight.ExtraBold,
+                                            fontSize = 11.sp, color = MaterialTheme.colorScheme.secondary)
                                     }
                                     Spacer(Modifier.height(8.dp))
-                                    if (section.type==SectionType.KNOWLEDGE_POINTS) {
-                                        section.body.split('\n').map{it.trimStart('-','*',' ')}.filter{it.isNotBlank()}.forEach { kp ->
-                                            SuggestionChip({},{Text(kp,fontWeight=FontWeight.Bold)},Modifier.padding(end=4.dp,bottom=4.dp))
-                                        }
+                                    if (section.type == SectionType.KNOWLEDGE_POINTS) {
+                                        section.body.split('\n')
+                                            .map { it.trimStart('-', '*', ' ') }.filter { it.isNotBlank() }
+                                            .forEach { kp ->
+                                                SuggestionChip({}, { Text(kp, fontWeight = FontWeight.Bold) },
+                                                    Modifier.padding(end = 4.dp, bottom = 4.dp))
+                                            }
                                     } else {
-                                        val analysisMd = MarkdownParser.preprocessLatex(
+                                        val bodyText = MarkdownParser.renderMath(
                                             MarkdownParser.normalizeImages(section.body, state.imageUrls)
                                         )
-                                        MathMarkdownView(analysisMd, markwon, Modifier.fillMaxWidth(),
-                                            textSize=16f, onImageClick={ url -> lightboxUrl=url })
+                                        MarkdownTextView(bodyText, markwon, Modifier.fillMaxWidth(),
+                                            textSize = 16f, onImageUrl = { url -> lightboxUrl = url })
                                     }
                                 }
                             }
@@ -244,35 +249,50 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
 // ── Grade buttons ─────────────────────────────────
 @Composable
 private fun GradeButtons(state: ReviewUiState, viewModel: ReviewViewModel) {
-    Row(Modifier.padding(horizontal=16.dp,vertical=6.dp), horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-        listOf(Triple(Grade.AGAIN,Color(0xFFB3261E),"🔴"),Triple(Grade.HARD,Color(0xFFE65C00),"🟠"),
-            Triple(Grade.GOOD,Color(0xFF2E7D32),"🟢"),Triple(Grade.EASY,Color(0xFF1565C0),"🔵"))
-            .forEach { (grade,color,emoji) ->
-                Button(onClick={viewModel.grade(grade)},
-                    modifier=Modifier.weight(if(grade==Grade.GOOD)1.2f else 1f).height(72.dp),
-                    shape=RoundedCornerShape(16.dp),
-                    colors=ButtonDefaults.buttonColors(containerColor=color), enabled=!state.isLoading) {
-                    Column(horizontalAlignment=Alignment.CenterHorizontally) {
-                        Text("$emoji ${grade.label}", fontSize=13.sp, fontWeight=FontWeight.ExtraBold)
-                        Text(if(grade==Grade.AGAIN)"重来" else "${state.intervals[grade]?:"—"}天",
-                            fontSize=10.sp, color=Color.White.copy(0.85f))
-                    }
+    Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf(
+            Triple(Grade.AGAIN, Color(0xFFB3261E), "🔴"),
+            Triple(Grade.HARD,  Color(0xFFE65C00), "🟠"),
+            Triple(Grade.GOOD,  Color(0xFF2E7D32), "🟢"),
+            Triple(Grade.EASY,  Color(0xFF1565C0), "🔵"),
+        ).forEach { (grade, color, emoji) ->
+            Button(
+                onClick  = { viewModel.grade(grade) },
+                modifier = Modifier.weight(if (grade == Grade.GOOD) 1.2f else 1f).height(72.dp),
+                shape    = RoundedCornerShape(16.dp),
+                colors   = ButtonDefaults.buttonColors(containerColor = color),
+                enabled  = !state.isLoading
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("$emoji ${grade.label}", fontSize = 13.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        if (grade == Grade.AGAIN) "重来"
+                        else "${state.intervals[grade] ?: "—"}天",
+                        fontSize = 10.sp, color = Color.White.copy(0.85f)
+                    )
                 }
             }
+        }
     }
 }
 
-// ── Markwon TextView with image click ────────────
+// ── Markdown TextView ─────────────────────────────
 @Composable
-fun MathMarkdownView(
+fun MarkdownTextView(
     text: String,
     markwon: Markwon,
     modifier: Modifier = Modifier,
     textSize: Float = 17f,
-    onImageClick: (String) -> Unit = {}
+    onImageUrl: (String) -> Unit = {}
 ) {
+    // Extract first image URL for tap-to-enlarge
+    val imgUrl = remember(text) {
+        Regex("""!\[.*?]\((.*?)\)""").find(text)?.groupValues?.get(1)
+    }
+
     AndroidView(
-        modifier = modifier,
+        modifier = if (imgUrl != null) modifier.clickable { onImageUrl(imgUrl) } else modifier,
         factory  = { ctx ->
             TextView(ctx).apply {
                 movementMethod = LinkMovementMethod.getInstance()
@@ -283,49 +303,23 @@ fun MathMarkdownView(
         update = { tv ->
             tv.textSize = textSize
             markwon.setMarkdown(tv, text)
-            // Wire up image click after Markwon renders
-            tv.post {
-                val spans = tv.text?.let { s ->
-                    if (s is android.text.Spanned) {
-                        s.getSpans(0, s.length, io.noties.markwon.image.AsyncDrawable::class.java)
-                    } else null
-                }
-                // Attach click listener to the whole TextView for simplicity
-                // User taps TextView → find if an image span is near tap position
-                tv.setOnClickListener {
-                    // Find first image URL and open lightbox
-                    val imgRegex = Regex("""!\[.*?]\((.*?)\)""")
-                    val match = imgRegex.find(text)
-                    match?.groupValues?.get(1)?.let { url ->
-                        if (url.startsWith("data:") || url.startsWith("http")) {
-                            onImageClick(url)
-                        }
-                    }
-                }
-            }
         }
     )
 }
 
-// ── Image lightbox with 5× zoom ──────────────────
+// ── Image Lightbox (5× zoom, no detectTransformGestures) ──
 @Composable
-fun ImageLightbox(url: String, onDismiss: () -> Unit) {
-    var scale by remember { mutableFloatStateOf(1f) }
-    var offsetX by remember { mutableFloatStateOf(0f) }
-    var offsetY by remember { mutableFloatStateOf(0f) }
+fun ImageLightboxDialog(url: String, onDismiss: () -> Unit) {
+    var scale  by remember { mutableFloatStateOf(1f) }
 
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Box(
-            Modifier
-                .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.95f))
-                .clickable { onDismiss() },
+            Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.96f)),
             contentAlignment = Alignment.Center
         ) {
-            // Close button
             IconButton(
                 onClick = onDismiss,
                 modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)
@@ -334,76 +328,76 @@ fun ImageLightbox(url: String, onDismiss: () -> Unit) {
             }
 
             if (url.startsWith("data:")) {
-                // Base64 image
                 val bitmap = remember(url) {
                     try {
-                        val base64 = url.substringAfter("base64,")
-                        val bytes  = Base64.decode(base64, Base64.DEFAULT)
+                        val b64   = url.substringAfter("base64,")
+                        val bytes = Base64.decode(b64, Base64.DEFAULT)
                         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                     } catch (_: Exception) { null }
                 }
                 bitmap?.let { bmp ->
-                    AndroidView(
+                    Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Fit,
                         modifier = Modifier
                             .fillMaxWidth(0.95f)
-                            .pointerInput(Unit) {
-                                detectTransformGestures { _, pan, zoom, _ ->
-                                    scale  = (scale * zoom).coerceIn(1f, 5f)
-                                    offsetX += pan.x
-                                    offsetY += pan.y
-                                }
-                            }
-                            .graphicsLayer(scaleX = scale, scaleY = scale,
-                                translationX = offsetX, translationY = offsetY),
-                        factory = { ctx ->
-                            android.widget.ImageView(ctx).apply {
-                                setImageBitmap(bmp)
-                                scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-                            }
-                        }
+                            .clickable { scale = if (scale < 4f) scale * 2f else 1f }
+                            .graphicsLayerScale(scale)
                     )
                 }
-            } else {
-                // URL image
-                AsyncImage(
-                    model = url,
-                    contentDescription = null,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxWidth(0.95f)
-                        .pointerInput(Unit) {
-                            detectTransformGestures { _, pan, zoom, _ ->
-                                scale  = (scale * zoom).coerceIn(1f, 5f)
-                                offsetX += pan.x
-                                offsetY += pan.y
-                            }
-                        }
-                        .graphicsLayer(scaleX = scale, scaleY = scale,
-                            translationX = offsetX, translationY = offsetY)
-                )
             }
 
-            // Hint
-            Text("双指缩放 / 点击关闭", color=Color.White.copy(0.5f), fontSize=12.sp,
-                modifier=Modifier.align(Alignment.BottomCenter).padding(bottom=24.dp))
+            // Zoom hint + tap to zoom button
+            Column(
+                Modifier.align(Alignment.BottomCenter).padding(bottom = 32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedButton(
+                        onClick = { scale = (scale * 1.5f).coerceAtMost(5f) },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                        border = BorderStroke(1.dp, Color.White.copy(0.5f))
+                    ) { Text("放大 +", color = Color.White) }
+                    OutlinedButton(
+                        onClick = { scale = (scale / 1.5f).coerceAtLeast(1f) },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                        border = BorderStroke(1.dp, Color.White.copy(0.5f))
+                    ) { Text("缩小 -", color = Color.White) }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("点击图片切换缩放 / 点击空白关闭", color = Color.White.copy(0.5f), fontSize = 12.sp)
+            }
         }
     }
 }
+
+// Helper extension to avoid detectTransformGestures dependency
+private fun Modifier.graphicsLayerScale(scale: Float): Modifier =
+    this.then(androidx.compose.ui.draw.scale(scale))
 
 // ── Heatmap ───────────────────────────────────────
 @Composable
 private fun HeatmapStrip(heatmap: Map<String, Int>) {
     val today = java.time.LocalDate.now()
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(14.dp,10.dp)) {
-        Text("近30天活跃度", fontSize=10.sp, fontWeight=FontWeight.Bold, letterSpacing=0.8.sp,
-            color=MaterialTheme.colorScheme.onSurfaceVariant)
+    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(14.dp, 10.dp)) {
+        Text("近30天活跃度", fontSize = 10.sp, fontWeight = FontWeight.Bold,
+            letterSpacing = 0.8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(6.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement=Arrangement.SpaceBetween) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             (29 downTo 0).forEach { i ->
-                val cnt = heatmap[today.minusDays(i.toLong()).toString()] ?: 0
-                val color = when { cnt==0->MaterialTheme.colorScheme.surfaceVariant; cnt<=5->Color(0xFF78E08F); cnt<=10->Color(0xFF38ADA9); else->Color(0xFF079992) }
-                Box(Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(2.dp)).background(color)
-                    .then(if(i==0) Modifier.border(1.5.dp,MaterialTheme.colorScheme.primary,RoundedCornerShape(2.dp)) else Modifier))
+                val cnt   = heatmap[today.minusDays(i.toLong()).toString()] ?: 0
+                val color = when {
+                    cnt == 0  -> MaterialTheme.colorScheme.surfaceVariant
+                    cnt <= 5  -> Color(0xFF78E08F)
+                    cnt <= 10 -> Color(0xFF38ADA9)
+                    else      -> Color(0xFF079992)
+                }
+                Box(Modifier.weight(1f).aspectRatio(1f)
+                    .clip(RoundedCornerShape(2.dp)).background(color)
+                    .then(if (i == 0) Modifier.border(
+                        1.5.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp)
+                    ) else Modifier))
             }
         }
     }
@@ -412,24 +406,29 @@ private fun HeatmapStrip(heatmap: Map<String, Int>) {
 // ── Stats ─────────────────────────────────────────
 @Composable
 private fun StatsRow(state: ReviewUiState) {
-    val label = state.card?.let { SM2.retentionLabel(SM2Card(it.interval,it.ease,it.reps,it.due,it.lapses)) } ?: ""
-    Row(Modifier.padding(14.dp,8.dp,14.dp,0.dp).fillMaxWidth(), horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-        listOf("${state.done}" to "已完成","${state.dueCount}" to "今日到期","${state.streak}天" to "连续").forEach { (n,l) ->
-            Card(Modifier.weight(1f), shape=RoundedCornerShape(14.dp),
-                colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surface)) {
-                Column(Modifier.padding(10.dp), horizontalAlignment=Alignment.CenterHorizontally) {
-                    Text(n, fontSize=20.sp, fontWeight=FontWeight.ExtraBold, color=MaterialTheme.colorScheme.primary)
-                    Text(l, fontSize=11.sp, color=MaterialTheme.colorScheme.onSurfaceVariant)
+    val label = state.card?.let {
+        SM2.retentionLabel(SM2Card(it.interval, it.ease, it.reps, it.due, it.lapses))
+    } ?: ""
+    Row(Modifier.padding(14.dp, 8.dp, 14.dp, 0.dp).fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf("${state.done}" to "已完成", "${state.dueCount}" to "今日到期", "${state.streak}天" to "连续")
+            .forEach { (num, lbl) ->
+                Card(Modifier.weight(1f), shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                    Column(Modifier.padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(num, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold,
+                            color = MaterialTheme.colorScheme.primary)
+                        Text(lbl, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
-        }
         if (label.isNotBlank()) {
-            Card(Modifier.weight(1f), shape=RoundedCornerShape(14.dp),
-                colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surface)) {
-                Column(Modifier.padding(10.dp), horizontalAlignment=Alignment.CenterHorizontally) {
-                    Text(label, fontSize=12.sp, fontWeight=FontWeight.ExtraBold,
-                        color=MaterialTheme.colorScheme.tertiary, maxLines=1)
-                    Text("状态", fontSize=11.sp, color=MaterialTheme.colorScheme.onSurfaceVariant)
+            Card(Modifier.weight(1f), shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                Column(Modifier.padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(label, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.tertiary, maxLines = 1)
+                    Text("状态", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
