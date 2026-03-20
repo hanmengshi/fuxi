@@ -17,7 +17,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
@@ -53,6 +52,7 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
     val snackState   = remember { SnackbarHostState() }
     var lightboxUrl  by remember { mutableStateOf<String?>(null) }
 
+    // Simple Markwon — NO LaTeX plugin needed, math is pre-converted to Unicode
     val markwon = remember {
         Markwon.builder(context)
             .usePlugin(HtmlPlugin.create())
@@ -63,6 +63,7 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
     LaunchedEffect(state.card?.path) { analysisOpen = false; swipeDx = 0f }
     LaunchedEffect(Unit) { viewModel.snack.collect { snackState.showSnackbar(it) } }
 
+    // Lightbox
     lightboxUrl?.let { url ->
         ImageLightboxDialog(url = url, onDismiss = { lightboxUrl = null })
     }
@@ -90,11 +91,10 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            LinearProgressIndicator(
-                progress = state.progress,
+            LinearProgressIndicator(progress = state.progress,
                 modifier = Modifier.fillMaxWidth(),
-                color = MaterialTheme.colorScheme.primary
-            )
+                color = MaterialTheme.colorScheme.primary)
+
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
                 HeatmapStrip(state.heatmap)
                 StatsRow(state)
@@ -112,6 +112,7 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
 
                 val parsed = state.parsedCard ?: return@Column
 
+                // ── Question card ─────────────────────────────
                 Box(Modifier.padding(16.dp).pointerInput(Unit) {
                     detectHorizontalDragGestures(
                         onDragEnd = {
@@ -153,22 +154,25 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                                     }
                                 }
                             }
+                            // Convert math to Unicode, then render as Markdown
                             val questionText = MarkdownParser.renderMath(
                                 MarkdownParser.normalizeImages(parsed.question, state.imageUrls)
                             )
                             MarkdownTextView(
-                                text     = questionText,
-                                markwon  = markwon,
-                                modifier = Modifier.fillMaxWidth(),
-                                textSize = 18f,
+                                text       = questionText,
+                                markwon    = markwon,
+                                modifier   = Modifier.fillMaxWidth(),
+                                textSize   = 18f,
                                 onImageUrl = { url -> lightboxUrl = url }
                             )
                         }
                     }
                 }
 
+                // ── Grade buttons ─────────────────────────────
                 GradeButtons(state, viewModel)
 
+                // ── Tag chips ─────────────────────────────────
                 Row(Modifier.padding(16.dp, 4.dp, 16.dp, 8.dp).fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceEvenly) {
                     listOf("难" to "🔥", "易" to "🍃", "易错" to "⚠️", "重点" to "⭐").forEach { (tag, icon) ->
@@ -179,6 +183,16 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                             contentPadding = PaddingValues(horizontal = 14.dp)
                         ) { Text("$icon $tag", fontSize = 14.sp, fontWeight = FontWeight.Bold) }
                     }
+                }
+
+                // ── Analysis ──────────────────────────────────
+                } catch (t: Throwable) {
+                    android.util.Log.e("ReviewScreen", "render error", t)
+                    androidx.compose.material3.Text(
+                        "渲染出错：${t.message}",
+                        modifier = Modifier.padding(16.dp),
+                        color = MaterialTheme.colorScheme.error
+                    )
                 }
 
                 if (parsed.analysis.isNotEmpty()) {
@@ -241,6 +255,7 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
     }
 }
 
+// ── Grade buttons ─────────────────────────────────
 @Composable
 private fun GradeButtons(state: ReviewUiState, viewModel: ReviewViewModel) {
     Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
@@ -271,6 +286,7 @@ private fun GradeButtons(state: ReviewUiState, viewModel: ReviewViewModel) {
     }
 }
 
+// ── Markdown TextView ─────────────────────────────
 @Composable
 fun MarkdownTextView(
     text: String,
@@ -279,9 +295,11 @@ fun MarkdownTextView(
     textSize: Float = 17f,
     onImageUrl: (String) -> Unit = {}
 ) {
+    // Extract first image URL for tap-to-enlarge
     val imgUrl = remember(text) {
         Regex("""!\[.*?]\((.*?)\)""").find(text)?.groupValues?.get(1)
     }
+
     AndroidView(
         modifier = if (imgUrl != null) modifier.clickable { onImageUrl(imgUrl) } else modifier,
         factory  = { ctx ->
@@ -298,17 +316,17 @@ fun MarkdownTextView(
     )
 }
 
+// ── Image Lightbox (5× zoom, no detectTransformGestures) ──
 @Composable
 fun ImageLightboxDialog(url: String, onDismiss: () -> Unit) {
-    var imgScale by remember { mutableFloatStateOf(1f) }
+    var scale  by remember { mutableFloatStateOf(1f) }
 
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Box(
-            Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.96f))
-                .clickable { onDismiss() },
+            Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.96f)),
             contentAlignment = Alignment.Center
         ) {
             IconButton(
@@ -327,39 +345,47 @@ fun ImageLightboxDialog(url: String, onDismiss: () -> Unit) {
                     } catch (_: Exception) { null }
                 }
                 bitmap?.let { bmp ->
-                    androidx.compose.foundation.Image(
+                    Image(
                         bitmap = bmp.asImageBitmap(),
                         contentDescription = null,
                         contentScale = ContentScale.Fit,
                         modifier = Modifier
                             .fillMaxWidth(0.95f)
-                            .scale(imgScale)
-                            .clickable(onClick = onDismiss)
+                            .clickable { scale = if (scale < 4f) scale * 2f else 1f }
+                            .graphicsLayerScale(scale)
                     )
                 }
             }
 
+            // Zoom hint + tap to zoom button
             Column(
                 Modifier.align(Alignment.BottomCenter).padding(bottom = 32.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     OutlinedButton(
-                        onClick = { imgScale = (imgScale * 1.5f).coerceAtMost(5f) },
+                        onClick = { scale = (scale * 1.5f).coerceAtMost(5f) },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
                         border = BorderStroke(1.dp, Color.White.copy(0.5f))
                     ) { Text("放大 +", color = Color.White) }
                     OutlinedButton(
-                        onClick = { imgScale = (imgScale / 1.5f).coerceAtLeast(1f) },
+                        onClick = { scale = (scale / 1.5f).coerceAtLeast(1f) },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
                         border = BorderStroke(1.dp, Color.White.copy(0.5f))
-                    ) { Text("缩小 −", color = Color.White) }
+                    ) { Text("缩小 -", color = Color.White) }
                 }
                 Spacer(Modifier.height(8.dp))
-                Text("点击空白处关闭", color = Color.White.copy(0.5f), fontSize = 12.sp)
+                Text("点击图片切换缩放 / 点击空白关闭", color = Color.White.copy(0.5f), fontSize = 12.sp)
             }
         }
     }
 }
 
+// Helper extension to avoid detectTransformGestures dependency
+private fun Modifier.graphicsLayerScale(scale: Float): Modifier =
+    this.then(androidx.compose.ui.draw.scale(scale))
+
+// ── Heatmap ───────────────────────────────────────
 @Composable
 private fun HeatmapStrip(heatmap: Map<String, Int>) {
     val today = java.time.LocalDate.now()
@@ -386,6 +412,7 @@ private fun HeatmapStrip(heatmap: Map<String, Int>) {
     }
 }
 
+// ── Stats ─────────────────────────────────────────
 @Composable
 private fun StatsRow(state: ReviewUiState) {
     val label = state.card?.let {
