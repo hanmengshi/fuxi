@@ -353,7 +353,7 @@ class ReviewViewModel @Inject constructor(
                     val bytes = dav.readFileBytes(dav.resolveImagePath(cardPath, name))
                     if (bytes.isNotEmpty()) {
                         val b64  = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-                        val ext  = name.substringAfterLast('.', "jpg").lowercase()
+                        val ext  = name.substringAfterLast(".").lowercase()
                         val mime = when(ext) { "png"->"image/png";"gif"->"image/gif";"webp"->"image/webp";else->"image/jpeg" }
                         val uri  = "data:$mime;base64,$b64"
                         map[name] = uri; imageCache[name] = uri
