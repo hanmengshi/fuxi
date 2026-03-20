@@ -19,8 +19,8 @@ import com.ankireview.utils.MarkdownParser
 import com.ankireview.utils.ParsedCard
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -64,7 +64,7 @@ data class ReviewUiState(
     val todayDone: Int                  = 0
 )
 
-private const val TAG = "ReviewViewModel"
+private const val TAG = "ReviewVM"
 
 @HiltViewModel
 class ReviewViewModel @Inject constructor(
@@ -78,283 +78,253 @@ class ReviewViewModel @Inject constructor(
     private val _screen = MutableStateFlow<Screen>(Screen.Login)
     val screen: StateFlow<Screen> = _screen.asStateFlow()
 
-    private val _snack  = MutableSharedFlow<String>()
+    private val _snack  = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val snack: SharedFlow<String> = _snack.asSharedFlow()
-
-    // Global exception handler - prevents any coroutine crash from propagating
-    private val exHandler = CoroutineExceptionHandler { _, throwable ->
-        Log.e(TAG, "Coroutine error", throwable)
-        viewModelScope.launch {
-            _state.update { it.copy(isLoading = false) }
-            _snack.emit("发生错误：${throwable.message ?: "未知"}")
-        }
-    }
 
     private var webDav: WebDavRepository? = null
     private var sessionCards: List<CardEntity> = emptyList()
     private var currentIndex: Int = 0
     private val imageCache = mutableMapOf<String, String>()
-    // Prevents double-grading from rapid button taps
-    private var isGrading = false
+    @Volatile private var grading = false
+
+    // Use SupervisorJob so child failures don't cancel the scope
+    private val safeJob = SupervisorJob()
 
     init {
-        viewModelScope.launch(exHandler) {
-            val prefs = ctx.dataStore.data.first()
-            val u = prefs[KEY_USERNAME]    ?: ""
-            val p = prefs[KEY_PASSWORD]    ?: ""
-            val f = prefs[KEY_FOLDER_PATH] ?: ""
-            val d = prefs[KEY_DAILY_LIMIT] ?: 20
-            _state.update { it.copy(savedUsername=u, savedPassword=p, savedFolderPath=f, dailyLimit=d) }
-            if (u.isNotBlank() && p.isNotBlank()) {
-                initWebDav(u, p)
-                loadFolder(f)
-                _screen.value = Screen.Folder
-            }
-            db.cardDao().getDueCount(LocalDate.now().toString()).collect { cnt ->
-                _state.update { it.copy(dueCount = cnt) }
-            }
+        viewModelScope.launch(Dispatchers.Main) {
+            try {
+                val prefs = ctx.dataStore.data.first()
+                val u = prefs[KEY_USERNAME]    ?: ""
+                val p = prefs[KEY_PASSWORD]    ?: ""
+                val f = prefs[KEY_FOLDER_PATH] ?: ""
+                val d = prefs[KEY_DAILY_LIMIT] ?: 20
+                _state.update { it.copy(savedUsername=u,savedPassword=p,savedFolderPath=f,dailyLimit=d) }
+                if (u.isNotBlank() && p.isNotBlank()) {
+                    initWebDav(u, p)
+                    loadFolder(f)
+                    _screen.value = Screen.Folder
+                }
+            } catch (t: Throwable) { Log.e(TAG, "init error", t) }
+        }
+        viewModelScope.launch(Dispatchers.Main) {
+            try {
+                db.cardDao().getDueCount(LocalDate.now().toString()).collect { cnt ->
+                    _state.update { it.copy(dueCount = cnt) }
+                }
+            } catch (t: Throwable) { Log.e(TAG, "dueCount error", t) }
         }
     }
 
     fun connect(username: String, password: String, folderPath: String) {
-        viewModelScope.launch(exHandler) {
+        viewModelScope.launch(Dispatchers.Main) {
             _state.update { it.copy(isLoading = true, error = null) }
             try {
                 initWebDav(username, password)
                 val ok = webDav!!.testConnection()
-                if (!ok) throw Exception("账号或密码错误，请检查后重试")
-                savePrefs(username, password, folderPath, _state.value.dailyLimit)
+                if (!ok) throw Exception("账号或密码错误")
+                persistPrefs(username, password, folderPath, _state.value.dailyLimit)
                 loadFolder(folderPath)
                 _screen.value = Screen.Folder
-            } catch (e: Exception) {
-                Log.e(TAG, "connect failed", e)
-                _state.update { it.copy(error = e.message, isLoading = false) }
-                _snack.emit("连接失败：${e.message}")
+            } catch (t: Throwable) {
+                Log.e(TAG, "connect error", t)
+                _state.update { it.copy(error = t.message, isLoading = false) }
+                _snack.tryEmit("连接失败：${t.message}")
             }
         }
     }
 
     fun disconnect() {
-        viewModelScope.launch(exHandler) {
-            ctx.dataStore.edit { it.clear() }
-            webDav = null
-            imageCache.clear()
-            sessionCards = emptyList()
-            currentIndex = 0
+        viewModelScope.launch(Dispatchers.Main) {
+            try { ctx.dataStore.edit { it.clear() } } catch (_: Throwable) {}
+            webDav = null; imageCache.clear()
+            sessionCards = emptyList(); currentIndex = 0; grading = false
             _state.value = ReviewUiState()
             _screen.value = Screen.Login
         }
     }
 
-    private fun initWebDav(username: String, password: String) {
-        webDav = WebDavRepository(WebDavRepository.JIANGUOYUN_URL, username, password)
+    private fun initWebDav(u: String, p: String) {
+        webDav = WebDavRepository(WebDavRepository.JIANGUOYUN_URL, u, p)
     }
 
     fun loadFolder(path: String, pushToStack: Boolean = false) {
-        viewModelScope.launch(exHandler) {
+        viewModelScope.launch(Dispatchers.Main) {
             _state.update { it.copy(isLoading = true) }
             try {
                 val items = withContext(Dispatchers.IO) { webDav!!.listFolder(path) }
-                val newStack = if (pushToStack && path != _state.value.currentPath)
+                val stack = if (pushToStack && path != _state.value.currentPath)
                     _state.value.pathStack + _state.value.currentPath
                 else _state.value.pathStack
-                _state.update { it.copy(folderItems=items, currentPath=path, pathStack=newStack, isLoading=false) }
-            } catch (e: Exception) {
-                Log.e(TAG, "loadFolder failed", e)
+                _state.update { it.copy(folderItems=items,currentPath=path,pathStack=stack,isLoading=false) }
+            } catch (t: Throwable) {
+                Log.e(TAG, "loadFolder error", t)
                 _state.update { it.copy(isLoading = false) }
-                _snack.emit("加载失败：${e.message}")
+                _snack.tryEmit("加载失败：${t.message}")
             }
         }
     }
 
-    fun enterFolder(folder: WebDavItem) = loadFolder(folder.href, pushToStack = true)
-
+    fun enterFolder(f: WebDavItem) = loadFolder(f.href, true)
     fun navigateUp(): Boolean {
         val stack = _state.value.pathStack
         return if (stack.isNotEmpty()) {
             val prev = stack.last()
             _state.update { it.copy(pathStack = stack.dropLast(1)) }
-            loadFolder(prev)
-            true
+            loadFolder(prev); true
         } else false
     }
-
     fun canNavigateUp() = _state.value.pathStack.isNotEmpty()
     fun refreshFolder()  = loadFolder(_state.value.currentPath)
 
     fun startReview(files: List<WebDavItem>) {
-        val dav = webDav ?: run {
-            viewModelScope.launch { _snack.emit("未连接坚果云，请重新登录") }
-            return
-        }
-        if (files.isEmpty()) {
-            viewModelScope.launch { _snack.emit("此文件夹没有题目文件") }
-            return
-        }
-        viewModelScope.launch(exHandler) {
+        val dav = webDav ?: run { _snack.tryEmit("未连接，请重新登录"); return }
+        if (files.isEmpty()) { _snack.tryEmit("没有题目文件"); return }
+        grading = false
+        viewModelScope.launch(Dispatchers.Main) {
             _state.update { it.copy(isLoading = true, selectedFiles = files) }
             try {
                 val today = LocalDate.now().toString()
                 val limit = _state.value.dailyLimit
-
                 val allCards = withContext(Dispatchers.IO) {
-                    val result = mutableListOf<CardEntity>()
-                    for (f in files) {
-                        val card = db.cardDao().getCard(f.href)
-                            ?: CardEntity(path = f.href, name = f.name)
-                                .also { db.cardDao().upsertCard(it) }
-                        result.add(card)
+                    files.map { f ->
+                        try { db.cardDao().getCard(f.href) } catch (_: Throwable) { null }
+                            ?: CardEntity(path=f.href, name=f.name).also {
+                                try { db.cardDao().upsertCard(it) } catch (_: Throwable) {}
+                            }
                     }
-                    result
                 }
-
                 val due    = allCards.filter { it.due <= today }.shuffled()
                 val newC   = allCards.filter { it.reps == 0 && it.due > today }.shuffled()
                 val future = allCards.filter { it.reps > 0  && it.due > today }.shuffled()
-
-                val session = mutableListOf<CardEntity>()
-                session.addAll(due)
-                if (session.size < limit) session.addAll(newC.take(limit - session.size))
-                if (session.size < limit) session.addAll(future.take(limit - session.size))
-                if (session.isEmpty()) session.addAll(allCards.shuffled())
-
-                // Snapshot the session - immutable from here
-                sessionCards = session.take(limit).toList()
+                val session = mutableListOf<CardEntity>().apply {
+                    addAll(due)
+                    if (size < limit) addAll(newC.take(limit - size))
+                    if (size < limit) addAll(future.take(limit - size))
+                    if (isEmpty()) addAll(allCards.shuffled())
+                }
+                sessionCards = session.take(limit)
                 currentIndex = 0
-
                 if (sessionCards.isEmpty()) {
                     _state.update { it.copy(isLoading = false) }
-                    _snack.emit("没有可复习的卡片")
-                    return@launch
+                    _snack.tryEmit("没有可复习的卡片"); return@launch
                 }
-
-                val hm    = buildHeatmap()
-                val today2 = LocalDate.now().toString()
+                val hm = buildHeatmap()
+                val t  = LocalDate.now().toString()
                 _state.update { it.copy(
-                    remaining = sessionCards.size, done = 0, progress = 0f,
-                    heatmap = hm, streak = calcStreak(hm), todayDone = hm[today2] ?: 0
+                    remaining=sessionCards.size, done=0, progress=0f,
+                    heatmap=hm, streak=calcStreak(hm), todayDone=hm[t]?:0
                 )}
-
-                // Load first card BEFORE navigating
-                val ok = safeLoadCard(dav, 0)
+                val ok = loadCardAt(dav, 0)
                 if (ok) _screen.value = Screen.Review
-                else { _state.update { it.copy(isLoading = false) }; _snack.emit("题目加载失败") }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "startReview failed", e)
+                else { _state.update { it.copy(isLoading=false) }; _snack.tryEmit("题目加载失败") }
+            } catch (t: Throwable) {
+                Log.e(TAG, "startReview error", t)
                 _state.update { it.copy(isLoading = false) }
-                _snack.emit("启动失败：${e.message}")
+                _snack.tryEmit("启动失败：${t.message}")
             }
         }
     }
 
-    // Safe card loader - returns true on success, false on failure, never throws
-    private suspend fun safeLoadCard(dav: WebDavRepository, index: Int): Boolean {
-        if (index < 0 || index >= sessionCards.size) return false
-        val card = sessionCards[index]
-        _state.update { it.copy(isLoading = true, card = card, parsedCard = null, imageUrls = emptyMap()) }
-        return try {
-            val content = withContext(Dispatchers.IO) { dav.readFile(card.path) }
-            val parsed  = MarkdownParser.parse(content)
-            val urlMap  = safeResolveImages(dav, card.path, parsed)
-            val sm2     = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
-            val prev    = SM2.preview(sm2)
-            _state.update { it.copy(
-                card=card, parsedCard=parsed, imageUrls=urlMap, intervals=prev,
-                isLoading=false, remaining=sessionCards.size - index
-            )}
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "loadCard[$index] failed: ${card.path}", e)
-            _state.update { it.copy(isLoading = false) }
-            false
-        }
-    }
-
-    fun grade(grade: Grade) {
-        // Prevent double-tap: use synchronized check
-        if (isGrading) return
-
-        // Validate state BEFORE setting guard
-        val dav   = webDav ?: return
+    // ── GRADE — the most important function ───────
+    fun grade(g: Grade) {
+        if (grading) { Log.w(TAG, "grade() blocked: still grading"); return }
+        val dav   = webDav ?: run { Log.w(TAG, "grade() webDav null"); return }
         val idx   = currentIndex
         val cards = sessionCards
-        val card  = cards.getOrNull(idx) ?: return
+        val card  = cards.getOrNull(idx) ?: run {
+            Log.w(TAG, "grade() no card at idx=$idx size=${cards.size}")
+            _screen.value = Screen.Finish; return
+        }
+        val total = cards.size
+        grading = true
+        Log.d(TAG, "grade() start idx=$idx total=$total grade=$g")
 
-        // Set guard only after validation passes
-        isGrading = true
-
-        viewModelScope.launch(exHandler) {
+        viewModelScope.launch(Dispatchers.Main + SupervisorJob()) {
             try {
-                // 1. Persist grade result
-                val sm2    = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
-                val result = SM2.calculate(sm2, grade)
-                val updated = card.copy(
-                    interval = result.interval, ease   = result.ease,
-                    reps     = result.reps,     due    = result.due,
-                    lapses   = result.lapses
-                )
-                withContext(Dispatchers.IO) {
-                    try {
-                        db.cardDao().upsertCard(updated)
-                        val today = LocalDate.now().toString()
-                        val hm    = db.cardDao().getHeatmap(today)
-                        db.cardDao().upsertHeatmap(HeatmapEntity(today, (hm?.count ?: 0) + 1))
-                    } catch (e: Exception) {
-                        Log.e(TAG, "DB write failed (non-fatal)", e)
-                        // Continue even if DB write fails
+                // Step 1: save result (non-fatal)
+                try {
+                    val sm2 = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
+                    val res = SM2.calculate(sm2, g)
+                    val upd = card.copy(interval=res.interval, ease=res.ease,
+                        reps=res.reps, due=res.due, lapses=res.lapses)
+                    withContext(Dispatchers.IO) {
+                        try {
+                            db.cardDao().upsertCard(upd)
+                            val today = LocalDate.now().toString()
+                            val hm = db.cardDao().getHeatmap(today)
+                            db.cardDao().upsertHeatmap(HeatmapEntity(today,(hm?.count?:0)+1))
+                        } catch (t: Throwable) { Log.e(TAG,"DB write error",t) }
                     }
-                }
+                } catch (t: Throwable) { Log.e(TAG, "SM2 calc error", t) }
 
-                // 2. Advance to next card
+                // Step 2: advance
                 val nextIdx = idx + 1
                 currentIndex = nextIdx
-                val total = cards.size
-
                 val hm    = buildHeatmap()
                 val today = LocalDate.now().toString()
                 _state.update { it.copy(
                     done      = nextIdx,
                     progress  = nextIdx.toFloat() / total.coerceAtLeast(1),
                     remaining = (total - nextIdx).coerceAtLeast(0),
-                    heatmap   = hm,
-                    todayDone = hm[today] ?: 0,
-                    streak    = calcStreak(hm)
+                    heatmap   = hm, todayDone = hm[today]?:0, streak = calcStreak(hm)
                 )}
+                Log.d(TAG, "grade() advanced to idx=$nextIdx")
 
-                // 3. Check if session finished
+                // Step 3: check done
                 if (nextIdx >= total) {
+                    Log.d(TAG, "grade() session complete")
                     _screen.value = Screen.Finish
-                    return@launch
-                }
-
-                // 4. Load next card (errors are handled inside safeLoadCard)
-                val loaded = safeLoadCard(dav, nextIdx)
-                if (!loaded) {
-                    // Skip one more if current failed
-                    val skipIdx = nextIdx + 1
-                    currentIndex = skipIdx
-                    if (skipIdx >= total) {
-                        _screen.value = Screen.Finish
-                    } else {
-                        safeLoadCard(dav, skipIdx)
+                } else {
+                    // Step 4: load next card
+                    Log.d(TAG, "grade() loading next card at idx=$nextIdx")
+                    val loaded = loadCardAt(dav, nextIdx)
+                    if (!loaded) {
+                        val skip = nextIdx + 1
+                        currentIndex = skip
+                        if (skip >= total) _screen.value = Screen.Finish
+                        else loadCardAt(dav, skip)
                     }
                 }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "grade() unexpected error", e)
+            } catch (t: Throwable) {
+                Log.e(TAG, "grade() FATAL error", t)
                 _state.update { it.copy(isLoading = false) }
-                _snack.emit("评分失败，请重试")
+                _snack.tryEmit("错误：${t.javaClass.simpleName}: ${t.message}")
             } finally {
-                // ALWAYS reset the guard, no matter what happened
-                isGrading = false
+                grading = false
+                Log.d(TAG, "grade() done, grading reset")
             }
         }
     }
 
+    private suspend fun loadCardAt(dav: WebDavRepository, index: Int): Boolean {
+        if (index < 0 || index >= sessionCards.size) return false
+        val card = sessionCards[index]
+        _state.update { it.copy(isLoading=true, card=card, parsedCard=null, imageUrls=emptyMap()) }
+        return try {
+            val raw    = withContext(Dispatchers.IO) { dav.readFile(card.path) }
+            val parsed = try { MarkdownParser.parse(raw) } catch (t: Throwable) {
+                Log.e(TAG, "parse error", t)
+                ParsedCard(raw, emptyList())
+            }
+            val urls = try { loadImages(dav, card.path, parsed) } catch (t: Throwable) {
+                Log.e(TAG, "image error (non-fatal)", t); emptyMap()
+            }
+            val sm2  = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
+            val prev = try { SM2.preview(sm2) } catch (t: Throwable) { emptyMap() }
+            _state.update { it.copy(
+                card=card, parsedCard=parsed, imageUrls=urls,
+                intervals=prev, isLoading=false, remaining=sessionCards.size-index
+            )}
+            Log.d(TAG, "loadCardAt[$index] OK: ${card.name}")
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "loadCardAt[$index] FATAL", t)
+            _state.update { it.copy(isLoading = false) }
+            false
+        }
+    }
 
-
-    private suspend fun safeResolveImages(
+    private suspend fun loadImages(
         dav: WebDavRepository, cardPath: String, parsed: ParsedCard
     ): Map<String, String> {
         val names = (MarkdownParser.extractObsidianImages(parsed.question) +
@@ -374,56 +344,58 @@ class ReviewViewModel @Inject constructor(
                         val uri  = "data:$mime;base64,$b64"
                         map[name] = uri; imageCache[name] = uri
                     }
-                } catch (_: Exception) { }
+                } catch (t: Throwable) { Log.w(TAG, "img skip: $name ${t.message}") }
             }
         }
         return map
     }
 
     fun addTag(tag: String) {
-        val idx  = currentIndex
-        val card = sessionCards.getOrNull(idx) ?: return
-        viewModelScope.launch(exHandler) {
-            _snack.emit("✅ 已标记：$tag")
+        val card = sessionCards.getOrNull(currentIndex) ?: return
+        viewModelScope.launch(Dispatchers.Main) {
+            _snack.tryEmit("✅ 已标记：$tag")
             withContext(Dispatchers.IO) {
                 try {
                     val dav = webDav ?: return@withContext
                     val raw = dav.readFile(card.path)
                     val conflict = mapOf("难" to "易", "易" to "难")[tag]
-                    var content = raw
-                    if (content.startsWith("---")) {
-                        val end = content.indexOf("\n---", 3)
+                    var c = raw
+                    if (c.startsWith("---")) {
+                        val end = c.indexOf("\n---", 3)
                         if (end != -1) {
-                            var head = content.substring(0, end)
+                            var head = c.substring(0, end)
                             if (conflict != null) head = head.replace(Regex("  - \"#?$conflict\"?\n"), "")
                             if (!head.contains("#$tag")) {
                                 head = if (head.contains("tags:"))
                                     head.replace(Regex("(tags:[ \\t]*\\r?\\n)"), "$1  - \"#$tag\"\n")
                                 else head + "\ntags:\n  - \"#$tag\""
                             }
-                            content = head + content.substring(end)
+                            c = head + c.substring(end)
                         }
-                    } else content = "---\ntags:\n  - \"#$tag\"\n---\n\n$content"
-                    dav.writeFile(card.path, content)
-                } catch (e: Exception) { Log.e(TAG, "addTag failed", e) }
+                    } else c = "---\ntags:\n  - \"#$tag\"\n---\n\n$c"
+                    dav.writeFile(card.path, c)
+                } catch (t: Throwable) { Log.e(TAG, "addTag error", t) }
             }
         }
     }
 
     fun setDailyLimit(limit: Int) {
-        viewModelScope.launch(exHandler) {
-            savePrefs(_state.value.savedUsername, _state.value.savedPassword,
+        viewModelScope.launch(Dispatchers.Main) {
+            persistPrefs(_state.value.savedUsername, _state.value.savedPassword,
                 _state.value.savedFolderPath, limit)
         }
     }
 
     fun goToFolder()    { _screen.value = Screen.Folder }
-    fun restartReview() { currentIndex = 0; sessionCards = emptyList(); startReview(_state.value.selectedFiles) }
-
-    private suspend fun buildHeatmap(): Map<String, Int> {
-        val from = LocalDate.now().minusDays(29).toString()
-        return withContext(Dispatchers.IO) { db.cardDao().getHeatmapRange(from).associate { it.date to it.count } }
+    fun restartReview() {
+        grading = false; currentIndex = 0; sessionCards = emptyList()
+        startReview(_state.value.selectedFiles)
     }
+
+    private suspend fun buildHeatmap(): Map<String, Int> = try {
+        val from = LocalDate.now().minusDays(29).toString()
+        withContext(Dispatchers.IO) { db.cardDao().getHeatmapRange(from).associate { it.date to it.count } }
+    } catch (t: Throwable) { Log.e(TAG, "heatmap error", t); emptyMap() }
 
     private fun calcStreak(hm: Map<String, Int>): Int {
         var s = 0
@@ -433,12 +405,11 @@ class ReviewViewModel @Inject constructor(
         return s
     }
 
-    private fun savePrefs(u: String, p: String, f: String, d: Int) {
-        viewModelScope.launch(exHandler) {
-            ctx.dataStore.edit { prefs ->
-                prefs[KEY_USERNAME]=u; prefs[KEY_PASSWORD]=p; prefs[KEY_FOLDER_PATH]=f; prefs[KEY_DAILY_LIMIT]=d
-            }
-            _state.update { it.copy(savedUsername=u, savedPassword=p, savedFolderPath=f, dailyLimit=d) }
-        }
+    private suspend fun persistPrefs(u: String, p: String, f: String, d: Int) {
+        try { ctx.dataStore.edit { prefs ->
+            prefs[KEY_USERNAME]=u; prefs[KEY_PASSWORD]=p
+            prefs[KEY_FOLDER_PATH]=f; prefs[KEY_DAILY_LIMIT]=d
+        }} catch (t: Throwable) { Log.e(TAG, "prefs error", t) }
+        _state.update { it.copy(savedUsername=u,savedPassword=p,savedFolderPath=f,dailyLimit=d) }
     }
 }
