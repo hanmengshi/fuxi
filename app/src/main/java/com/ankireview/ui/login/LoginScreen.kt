@@ -24,10 +24,18 @@ import com.ankireview.ui.ReviewViewModel
 fun LoginScreen(viewModel: ReviewViewModel) {
     val state by viewModel.state.collectAsState()
 
-    var username by remember { mutableStateOf(state.savedUsername) }
-    var password by remember { mutableStateOf(state.savedPassword) }
-    var folder   by remember { mutableStateOf(state.savedFolderPath) }
+    // Pre-populate from saved credentials - update when state loads from DataStore
+    var username by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var folder   by remember { mutableStateOf("") }
     var showPass by remember { mutableStateOf(false) }
+
+    // Sync saved values when DataStore finishes loading
+    LaunchedEffect(state.savedUsername, state.savedPassword, state.savedFolderPath) {
+        if (username.isEmpty() && state.savedUsername.isNotEmpty()) username = state.savedUsername
+        if (password.isEmpty() && state.savedPassword.isNotEmpty()) password = state.savedPassword
+        if (folder.isEmpty()   && state.savedFolderPath.isNotEmpty()) folder = state.savedFolderPath
+    }
 
     val floatY by rememberInfiniteTransition(label = "float").animateFloat(
         initialValue = 0f, targetValue = -10f,
@@ -75,7 +83,6 @@ fun LoginScreen(viewModel: ReviewViewModel) {
                     Modifier.padding(24.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    // 账号
                     Column {
                         Text(
                             "坚果云账号（邮箱）",
@@ -86,12 +93,8 @@ fun LoginScreen(viewModel: ReviewViewModel) {
                         OutlinedTextField(
                             value = username, onValueChange = { username = it },
                             modifier = Modifier.fillMaxWidth(),
-                            placeholder = {
-                                Text("your@email.com", color = Color.White.copy(0.3f))
-                            },
-                            leadingIcon = {
-                                Icon(Icons.Default.Email, null, tint = Color.White.copy(0.5f))
-                            },
+                            placeholder = { Text("your@email.com", color = Color.White.copy(0.3f)) },
+                            leadingIcon = { Icon(Icons.Default.Email, null, tint = Color.White.copy(0.5f)) },
                             shape = RoundedCornerShape(12.dp),
                             colors = fieldColors(),
                             singleLine = true,
@@ -99,7 +102,6 @@ fun LoginScreen(viewModel: ReviewViewModel) {
                         )
                     }
 
-                    // 应用密码
                     Column {
                         Text(
                             "应用密码（非登录密码）",
@@ -110,17 +112,12 @@ fun LoginScreen(viewModel: ReviewViewModel) {
                         OutlinedTextField(
                             value = password, onValueChange = { password = it },
                             modifier = Modifier.fillMaxWidth(),
-                            placeholder = {
-                                Text("坚果云应用密码", color = Color.White.copy(0.3f))
-                            },
-                            leadingIcon = {
-                                Icon(Icons.Default.Lock, null, tint = Color.White.copy(0.5f))
-                            },
+                            placeholder = { Text("坚果云应用密码", color = Color.White.copy(0.3f)) },
+                            leadingIcon = { Icon(Icons.Default.Lock, null, tint = Color.White.copy(0.5f)) },
                             trailingIcon = {
                                 IconButton(onClick = { showPass = !showPass }) {
                                     Icon(
-                                        if (showPass) Icons.Default.VisibilityOff
-                                        else Icons.Default.Visibility,
+                                        if (showPass) Icons.Default.VisibilityOff else Icons.Default.Visibility,
                                         null, tint = Color.White.copy(0.5f)
                                     )
                                 }
@@ -138,7 +135,6 @@ fun LoginScreen(viewModel: ReviewViewModel) {
                         )
                     }
 
-                    // 文件夹路径
                     Column {
                         Text(
                             "题目文件夹路径（留空则为根目录）",
@@ -149,12 +145,8 @@ fun LoginScreen(viewModel: ReviewViewModel) {
                         OutlinedTextField(
                             value = folder, onValueChange = { folder = it },
                             modifier = Modifier.fillMaxWidth(),
-                            placeholder = {
-                                Text("例如：复习题/数学", color = Color.White.copy(0.3f))
-                            },
-                            leadingIcon = {
-                                Icon(Icons.Default.Folder, null, tint = Color.White.copy(0.5f))
-                            },
+                            placeholder = { Text("例如：72数学", color = Color.White.copy(0.3f)) },
+                            leadingIcon = { Icon(Icons.Default.Folder, null, tint = Color.White.copy(0.5f)) },
                             shape = RoundedCornerShape(12.dp),
                             colors = fieldColors(),
                             singleLine = true
@@ -163,13 +155,8 @@ fun LoginScreen(viewModel: ReviewViewModel) {
 
                     Spacer(Modifier.height(4.dp))
 
-                    // 连接按钮
                     Button(
-                        onClick = {
-                            viewModel.connect(
-                                username.trim(), password.trim(), folder.trim()
-                            )
-                        },
+                        onClick = { viewModel.connect(username.trim(), password.trim(), folder.trim()) },
                         enabled = username.isNotBlank() && password.isNotBlank() && !state.isLoading,
                         modifier = Modifier.fillMaxWidth().height(52.dp),
                         shape = RoundedCornerShape(26.dp),
@@ -199,7 +186,6 @@ fun LoginScreen(viewModel: ReviewViewModel) {
 
             Spacer(Modifier.height(20.dp))
 
-            // 帮助卡片
             Card(
                 Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
