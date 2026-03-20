@@ -106,7 +106,6 @@ class ReviewViewModel @Inject constructor(
         }
     }
 
-    // ── Auth ──────────────────────────────────────
     fun connect(username: String, password: String, folderPath: String) {
         viewModelScope.launch {
             _state.update { it.copy(isLoading = true, error = null) }
@@ -138,14 +137,11 @@ class ReviewViewModel @Inject constructor(
         webDav = WebDavRepository(WebDavRepository.JIANGUOYUN_URL, username, password)
     }
 
-    // ── Folder navigation ─────────────────────────
     fun loadFolder(path: String, pushToStack: Boolean = false) {
         viewModelScope.launch {
             _state.update { it.copy(isLoading = true) }
             try {
-                val items = withContext(Dispatchers.IO) {
-                    webDav!!.listFolder(path)
-                }
+                val items = withContext(Dispatchers.IO) { webDav!!.listFolder(path) }
                 val newStack = if (pushToStack && path != _state.value.currentPath)
                     _state.value.pathStack + _state.value.currentPath
                 else _state.value.pathStack
@@ -177,10 +173,7 @@ class ReviewViewModel @Inject constructor(
     fun canNavigateUp() = _state.value.pathStack.isNotEmpty()
     fun refreshFolder()  = loadFolder(_state.value.currentPath)
 
-    // ── Start review ──────────────────────────────
-    // KEY FIX: switch to Review screen ONLY after first card finishes loading
     fun startReview(files: List<WebDavItem>) {
-        // Guard: must have a valid connection
         val dav = webDav
         if (dav == null) {
             viewModelScope.launch { _snack.emit("未连接坚果云，请重新登录") }
@@ -190,14 +183,12 @@ class ReviewViewModel @Inject constructor(
             viewModelScope.launch { _snack.emit("此文件夹没有题目文件") }
             return
         }
-
         viewModelScope.launch {
             _state.update { it.copy(isLoading = true, selectedFiles = files) }
             try {
                 val today = LocalDate.now().toString()
                 val limit = _state.value.dailyLimit
 
-                // Step 1: ensure all files have a DB record (IO thread, explicit loop)
                 val allCards = withContext(Dispatchers.IO) {
                     val result = mutableListOf<CardEntity>()
                     for (f in files) {
@@ -210,17 +201,14 @@ class ReviewViewModel @Inject constructor(
                     result
                 }
 
-                // Step 2: bucket cards
                 val due    = allCards.filter { it.due <= today }.shuffled()
                 val newC   = allCards.filter { it.reps == 0 && it.due > today }.shuffled()
                 val future = allCards.filter { it.reps > 0  && it.due > today }.shuffled()
 
-                // Step 3: build session
                 val session = mutableListOf<CardEntity>()
                 session.addAll(due)
                 if (session.size < limit) session.addAll(newC.take(limit - session.size))
                 if (session.size < limit) session.addAll(future.take(limit - session.size))
-                // If still empty (all cards are new with default due), use all cards
                 if (session.isEmpty()) session.addAll(allCards.shuffled())
 
                 queue        = ArrayDeque(session.take(limit))
@@ -242,8 +230,7 @@ class ReviewViewModel @Inject constructor(
                     todayDone = hm[today] ?: 0
                 )}
 
-                // Step 4: load first card content BEFORE switching screen
-                // This prevents ReviewScreen from seeing null parsedCard on first render
+                // Load first card BEFORE switching to Review screen
                 loadFirstCard(dav)
 
             } catch (e: Exception) {
@@ -253,7 +240,6 @@ class ReviewViewModel @Inject constructor(
         }
     }
 
-    // Loads first card and then navigates to Review screen
     private suspend fun loadFirstCard(dav: WebDavRepository) {
         if (queue.isEmpty()) {
             _state.update { it.copy(isLoading = false) }
@@ -266,7 +252,6 @@ class ReviewViewModel @Inject constructor(
             val parsed  = MarkdownParser.parse(content)
             val urlMap  = resolveImages(dav, card.path, parsed)
             val prev    = SM2.preview(SM2Card(card.interval, card.ease, card.reps, card.due))
-
             _state.update { it.copy(
                 card       = card,
                 parsedCard = parsed,
@@ -274,11 +259,9 @@ class ReviewViewModel @Inject constructor(
                 intervals  = prev,
                 isLoading  = false
             )}
-            // Navigate to Review only after data is ready
+            // Only navigate after data is ready
             _screen.value = Screen.Review
-
         } catch (e: Exception) {
-            // Failed to load first card - skip and try next
             queue.removeFirst()
             if (queue.isNotEmpty()) {
                 loadFirstCard(dav)
@@ -321,7 +304,6 @@ class ReviewViewModel @Inject constructor(
                 return@launch
             }
 
-            // Load next card
             val dav = webDav ?: run { _snack.emit("连接已断开"); return@launch }
             val next = queue.first()
             _state.update { it.copy(isLoading = true, card = next, parsedCard = null, imageUrls = emptyMap()) }
@@ -338,7 +320,7 @@ class ReviewViewModel @Inject constructor(
                 )}
             } catch (e: Exception) {
                 _state.update { it.copy(isLoading = false) }
-                _snack.emit("加载下一题失败，已跳过：${e.message}")
+                _snack.emit("加载下一题失败，已跳过")
                 queue.removeFirst()
                 if (queue.isEmpty()) _screen.value = Screen.Finish
             }
@@ -357,24 +339,29 @@ class ReviewViewModel @Inject constructor(
         val urlMap = mutableMapOf<String, String>()
         withContext(Dispatchers.IO) {
             for (name in imgNames) {
-                imageCache[name]?.let { urlMap[name] = it; continue }
-                try {
-                    val imgPath = dav.resolveImagePath(cardPath, name)
-                    val bytes   = dav.readFileBytes(imgPath)
-                    if (bytes.isNotEmpty()) {
-                        val b64  = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-                        val ext  = name.substringAfterLast('.', "jpg").lowercase()
-                        val mime = when (ext) {
-                            "png"  -> "image/png"
-                            "gif"  -> "image/gif"
-                            "webp" -> "image/webp"
-                            else   -> "image/jpeg"
+                val cached = imageCache[name]
+                if (cached != null) {
+                    urlMap[name] = cached
+                } else {
+                    try {
+                        val imgPath = dav.resolveImagePath(cardPath, name)
+                        val bytes   = dav.readFileBytes(imgPath)
+                        if (bytes.isNotEmpty()) {
+                            val b64  = android.util.Base64.encodeToString(
+                                bytes, android.util.Base64.NO_WRAP)
+                            val ext  = name.substringAfterLast('.', "jpg").lowercase()
+                            val mime = when (ext) {
+                                "png"  -> "image/png"
+                                "gif"  -> "image/gif"
+                                "webp" -> "image/webp"
+                                else   -> "image/jpeg"
+                            }
+                            val uri = "data:$mime;base64,$b64"
+                            urlMap[name]     = uri
+                            imageCache[name] = uri
                         }
-                        val uri = "data:$mime;base64,$b64"
-                        urlMap[name]     = uri
-                        imageCache[name] = uri
-                    }
-                } catch (_: Exception) { /* image not found, skip */ }
+                    } catch (_: Exception) { }
+                }
             }
         }
         return urlMap
@@ -438,7 +425,10 @@ class ReviewViewModel @Inject constructor(
         return s
     }
 
-    private fun savePrefs(username: String, password: String, folderPath: String, dailyLimit: Int) {
+    private fun savePrefs(
+        username: String, password: String,
+        folderPath: String, dailyLimit: Int
+    ) {
         viewModelScope.launch {
             ctx.dataStore.edit { prefs ->
                 prefs[KEY_USERNAME]    = username
