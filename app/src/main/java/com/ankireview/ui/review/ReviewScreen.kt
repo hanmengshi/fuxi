@@ -46,19 +46,11 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
     val THRESHOLD    = 180f
     val snackState   = remember { SnackbarHostState() }
 
-    // Build Markwon with LaTeX support — font size 48sp for math rendering
     val markwon = remember {
         Markwon.builder(context)
             .usePlugin(HtmlPlugin.create())
             .usePlugin(ImagesPlugin.create())
-            .usePlugin(
-                JLatexMathPlugin.create(
-                    48f,  // math font size
-                    JLatexMathPlugin.BuilderConfigure { builder ->
-                        builder.inlinesEnabled(true)  // enable $...$ inline math
-                    }
-                )
-            )
+            .usePlugin(JLatexMathPlugin.create(48f))  // LaTeX math rendering
             .build()
     }
 
@@ -82,12 +74,10 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                     }
                 },
                 actions = {
-                    Text(
-                        "${state.remaining} 剩",
+                    Text("${state.remaining} 剩",
                         modifier = Modifier.padding(end = 16.dp),
                         color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold, fontSize = 14.sp
-                    )
+                        fontWeight = FontWeight.Bold, fontSize = 14.sp)
                 }
             )
         }
@@ -117,7 +107,7 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
 
                 val parsed = state.parsedCard ?: return@Column
 
-                // ── Question card with swipe ──────────────────
+                // Question card with swipe
                 Box(Modifier.padding(16.dp).pointerInput(Unit) {
                     detectHorizontalDragGestures(
                         onDragEnd = {
@@ -133,7 +123,7 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                         modifier = Modifier.fillMaxWidth()
                             .rotate((swipeDx / 30f).coerceIn(-8f, 8f))
                             .offset(x = (swipeDx / 4).dp),
-                        shape = RoundedCornerShape(20.dp),
+                        shape  = RoundedCornerShape(20.dp),
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                         elevation = CardDefaults.cardElevation(4.dp),
                         border = BorderStroke(3.dp, MaterialTheme.colorScheme.primary.copy(0.5f))
@@ -159,22 +149,19 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                                     }
                                 }
                             }
-                            // Render markdown with LaTeX
                             MarkdownView(
-                                markdown = MarkdownParser.normalizeImages(parsed.question, state.imageUrls),
-                                markwon  = markwon,
-                                modifier = Modifier.fillMaxWidth(),
-                                textSizeSp = 18f,
-                                imageSizeMult = 3f   // 3x image size
+                                markdown   = MarkdownParser.normalizeImages(parsed.question, state.imageUrls),
+                                markwon    = markwon,
+                                modifier   = Modifier.fillMaxWidth(),
+                                textSizeSp = 18f
                             )
                         }
                     }
                 }
 
-                // ── Grade buttons ─────────────────────────────
                 GradeButtons(state, viewModel)
 
-                // ── Tag chips ─────────────────────────────────
+                // Tag chips
                 Row(Modifier.padding(16.dp, 4.dp, 16.dp, 8.dp).fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceEvenly) {
                     listOf("难" to "🔥", "易" to "🍃", "易错" to "⚠️", "重点" to "⭐").forEach { (tag, icon) ->
@@ -187,11 +174,12 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                     }
                 }
 
-                // ── Analysis ──────────────────────────────────
+                // Analysis
                 if (parsed.analysis.isNotEmpty()) {
                     val rotation by animateFloatAsState(if (analysisOpen) 180f else 0f, label = "arr")
                     OutlinedCard(
-                        Modifier.fillMaxWidth().padding(16.dp, 4.dp).clickable { analysisOpen = !analysisOpen },
+                        Modifier.fillMaxWidth().padding(16.dp, 4.dp)
+                            .clickable { analysisOpen = !analysisOpen },
                         shape = RoundedCornerShape(16.dp)
                     ) {
                         Row(Modifier.padding(16.dp, 14.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -201,7 +189,6 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                                 tint = MaterialTheme.colorScheme.primary)
                         }
                     }
-
                     if (analysisOpen) {
                         parsed.analysis.forEach { section ->
                             Card(
@@ -224,16 +211,19 @@ fun ReviewScreen(viewModel: ReviewViewModel) {
                                     }
                                     Spacer(Modifier.height(8.dp))
                                     if (section.type == SectionType.KNOWLEDGE_POINTS) {
-                                        section.body.split('\n').map { it.trimStart('-','*',' ') }
-                                            .filter { it.isNotBlank() }.forEach { kp ->
+                                        section.body.split('\n')
+                                            .map { it.trimStart('-','*',' ') }
+                                            .filter { it.isNotBlank() }
+                                            .forEach { kp ->
                                                 SuggestionChip({}, { Text(kp, fontWeight = FontWeight.Bold) },
                                                     Modifier.padding(end = 4.dp, bottom = 4.dp))
                                             }
                                     } else {
                                         MarkdownView(
-                                            MarkdownParser.normalizeImages(section.body, state.imageUrls),
-                                            markwon, Modifier.fillMaxWidth(),
-                                            textSizeSp = 16f, imageSizeMult = 3f
+                                            markdown   = MarkdownParser.normalizeImages(section.body, state.imageUrls),
+                                            markwon    = markwon,
+                                            modifier   = Modifier.fillMaxWidth(),
+                                            textSizeSp = 16f
                                         )
                                     }
                                 }
@@ -267,7 +257,8 @@ private fun GradeButtons(state: ReviewUiState, viewModel: ReviewViewModel) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("$emoji ${grade.label}", fontSize = 13.sp, fontWeight = FontWeight.ExtraBold)
                     Text(
-                        if (grade == Grade.AGAIN) "重来" else "${state.intervals[grade] ?: "—"}天",
+                        if (grade == Grade.AGAIN) "重来"
+                        else "${state.intervals[grade] ?: "—"}天",
                         fontSize = 10.sp, color = Color.White.copy(0.85f)
                     )
                 }
@@ -276,17 +267,12 @@ private fun GradeButtons(state: ReviewUiState, viewModel: ReviewViewModel) {
     }
 }
 
-/**
- * Markwon TextView wrapper.
- * imageSizeMult: multiply displayed image size (default 1x; pass 3f for 3x)
- */
 @Composable
 fun MarkdownView(
     markdown: String,
     markwon: Markwon,
     modifier: Modifier = Modifier,
-    textSizeSp: Float = 17f,
-    imageSizeMult: Float = 1f
+    textSizeSp: Float = 17f
 ) {
     AndroidView(
         modifier = modifier,
@@ -299,8 +285,6 @@ fun MarkdownView(
         },
         update = { tv ->
             tv.textSize = textSizeSp
-            // Apply image size multiplier via custom drawable factory would need
-            // Markwon image plugin config — here we just set max width via layout
             markwon.setMarkdown(tv, markdown)
         }
     )
@@ -309,7 +293,9 @@ fun MarkdownView(
 @Composable
 private fun HeatmapStrip(heatmap: Map<String, Int>) {
     val today = java.time.LocalDate.now()
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(14.dp, 10.dp)) {
+    Column(Modifier.fillMaxWidth()
+        .background(MaterialTheme.colorScheme.surface)
+        .padding(14.dp, 10.dp)) {
         Text("近30天活跃度", fontSize = 10.sp, fontWeight = FontWeight.Bold,
             letterSpacing = 0.8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(6.dp))
@@ -323,8 +309,14 @@ private fun HeatmapStrip(heatmap: Map<String, Int>) {
                     count <= 10 -> Color(0xFF38ADA9)
                     else        -> Color(0xFF079992)
                 }
-                Box(Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(2.dp)).background(color)
-                    .then(if (i == 0) Modifier.border(1.5.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp)) else Modifier))
+                Box(
+                    Modifier.weight(1f).aspectRatio(1f)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(color)
+                        .then(if (i == 0) Modifier.border(
+                            1.5.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp)
+                        ) else Modifier)
+                )
             }
         }
     }
@@ -332,7 +324,6 @@ private fun HeatmapStrip(heatmap: Map<String, Int>) {
 
 @Composable
 private fun StatsRow(state: ReviewUiState) {
-    // Show SM-2 card status for current card
     val cardStatus = state.card?.let { card ->
         val sm2 = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
         SM2.retentionLabel(sm2)
@@ -341,9 +332,9 @@ private fun StatsRow(state: ReviewUiState) {
     Row(Modifier.padding(14.dp, 8.dp, 14.dp, 0.dp).fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         listOf(
-            "${state.done}"    to "已完成",
-            "${state.dueCount}" to "今日到期",
-            "${state.streak}天" to "连续复习"
+            "${state.done}"      to "已完成",
+            "${state.dueCount}"  to "今日到期",
+            "${state.streak}天"  to "连续复习"
         ).forEach { (num, label) ->
             Card(Modifier.weight(1f), shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
@@ -354,13 +345,12 @@ private fun StatsRow(state: ReviewUiState) {
                 }
             }
         }
-        // Card status chip
         if (cardStatus.isNotBlank()) {
             Card(Modifier.weight(1f), shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
                 Column(Modifier.padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(cardStatus, fontSize = 13.sp, fontWeight = FontWeight.ExtraBold,
-                        color = MaterialTheme.colorScheme.tertiary)
+                    Text(cardStatus, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.tertiary, maxLines = 1)
                     Text("卡片状态", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
