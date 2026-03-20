@@ -102,7 +102,7 @@ fun LoginScreen(viewModel: ReviewViewModel) {
                             singleLine = true
                         )
                         // 提示
-                        Text("⚠️ 请在坚果云网页版 → 账户信息 → 安全选项 → 第三方应用管理 中生成应用密码",
+                        Text("请在坚果云网页版生成应用密码（账户信息->安全选项->第三方应用管理）",
                             fontSize = 11.sp, color = Color.White.copy(0.4f), lineHeight = 16.sp)
                     }
 
