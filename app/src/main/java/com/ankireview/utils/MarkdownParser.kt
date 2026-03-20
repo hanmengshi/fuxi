@@ -17,11 +17,11 @@ object MarkdownParser {
             val after = body.substring(idx + MARKER.length)
             val h2 = Regex("""\n##\s""").find(after)
             question    = h2?.let { after.substring(0, it.range.first).trim() } ?: after.trim()
-            analysisRaw = h2?.let { after.substring(it.range.first).trim() } ?: ""
+            analysisRaw = h2?.let { after.substring(it.range.first).trim() }    ?: ""
         } else {
             val h2 = Regex("""\n##\s""").find(body)
             question    = h2?.let { body.substring(0, it.range.first).trim() } ?: body
-            analysisRaw = h2?.let { body.substring(it.range.first).trim() } ?: ""
+            analysisRaw = h2?.let { body.substring(it.range.first).trim() }    ?: ""
         }
         return ParsedCard(question, parseAnalysis(analysisRaw))
     }
@@ -52,4 +52,26 @@ object MarkdownParser {
             val url  = urlMap[name] ?: urlMap[name.substringAfterLast('/')]
             if (url != null) "![$name]($url)" else "> ⚠️ 图片未找到：$name"
         }
+
+    /**
+     * Pre-process LaTeX so Markwon can render it correctly.
+     * Converts $...$ to \(...\) and $$...$$ to \[...\]
+     * This is more reliable than relying on JLatexMathPlugin inline detection.
+     */
+    fun preprocessLatex(text: String): String {
+        var result = text
+        // Block math: $$...$$ -> \[...\]  (must do before inline)
+        result = Regex("""\$\$([\s\S]+?)\$\$""").replace(result) { mr ->
+            "\\[${mr.groupValues[1]}\\]"
+        }
+        // Inline math: $...$ -> \(...\)
+        // Avoid replacing already-converted \[...\] and currency like $10
+        result = Regex("""\$([^$\n]+?)\$""").replace(result) { mr ->
+            val inner = mr.groupValues[1].trim()
+            // Skip if it looks like currency (starts with digit or is very short)
+            if (inner.isEmpty()) mr.value
+            else "\\(${mr.groupValues[1]}\\)"
+        }
+        return result
+    }
 }
