@@ -272,54 +272,66 @@ class ReviewViewModel @Inject constructor(
     }
 
     fun grade(grade: Grade) {
-        // Synchronous guard — prevents double-tap crash
+        // Prevent double-tap: use synchronized check
         if (isGrading) return
+
+        // Validate state BEFORE setting guard
+        val dav   = webDav ?: return
+        val idx   = currentIndex
+        val cards = sessionCards
+        val card  = cards.getOrNull(idx) ?: return
+
+        // Set guard only after validation passes
         isGrading = true
-        // Capture everything we need at call time - avoid accessing mutable state later
-        val dav     = webDav    ?: run { viewModelScope.launch { _snack.emit("连接已断开") }; return }
-        val idx     = currentIndex
-        val cards   = sessionCards
-        val card    = cards.getOrNull(idx) ?: run { viewModelScope.launch { _screen.value = Screen.Finish }; return }
-        val total   = cards.size
 
         viewModelScope.launch(exHandler) {
             try {
-                // 1. Persist grade
+                // 1. Persist grade result
                 val sm2    = SM2Card(card.interval, card.ease, card.reps, card.due, card.lapses)
                 val result = SM2.calculate(sm2, grade)
                 val updated = card.copy(
-                    interval=result.interval, ease=result.ease,
-                    reps=result.reps, due=result.due, lapses=result.lapses
+                    interval = result.interval, ease   = result.ease,
+                    reps     = result.reps,     due    = result.due,
+                    lapses   = result.lapses
                 )
                 withContext(Dispatchers.IO) {
-                    db.cardDao().upsertCard(updated)
-                    val today = LocalDate.now().toString()
-                    val hm    = db.cardDao().getHeatmap(today)
-                    db.cardDao().upsertHeatmap(HeatmapEntity(today, (hm?.count ?: 0) + 1))
+                    try {
+                        db.cardDao().upsertCard(updated)
+                        val today = LocalDate.now().toString()
+                        val hm    = db.cardDao().getHeatmap(today)
+                        db.cardDao().upsertHeatmap(HeatmapEntity(today, (hm?.count ?: 0) + 1))
+                    } catch (e: Exception) {
+                        Log.e(TAG, "DB write failed (non-fatal)", e)
+                        // Continue even if DB write fails
+                    }
                 }
 
-                // 2. Advance index
+                // 2. Advance to next card
                 val nextIdx = idx + 1
                 currentIndex = nextIdx
+                val total = cards.size
+
                 val hm    = buildHeatmap()
                 val today = LocalDate.now().toString()
                 _state.update { it.copy(
-                    done     = nextIdx,
-                    progress = nextIdx.toFloat() / total.coerceAtLeast(1),
-                    remaining= (total - nextIdx).coerceAtLeast(0),
-                    heatmap  = hm, todayDone = hm[today] ?: 0, streak = calcStreak(hm)
+                    done      = nextIdx,
+                    progress  = nextIdx.toFloat() / total.coerceAtLeast(1),
+                    remaining = (total - nextIdx).coerceAtLeast(0),
+                    heatmap   = hm,
+                    todayDone = hm[today] ?: 0,
+                    streak    = calcStreak(hm)
                 )}
 
-                // 3. Done?
+                // 3. Check if session finished
                 if (nextIdx >= total) {
                     _screen.value = Screen.Finish
                     return@launch
                 }
 
-                // 4. Load next card
-                val ok = safeLoadCard(dav, nextIdx)
-                if (!ok) {
-                    // Try one more skip
+                // 4. Load next card (errors are handled inside safeLoadCard)
+                val loaded = safeLoadCard(dav, nextIdx)
+                if (!loaded) {
+                    // Skip one more if current failed
                     val skipIdx = nextIdx + 1
                     currentIndex = skipIdx
                     if (skipIdx >= total) {
@@ -328,101 +340,16 @@ class ReviewViewModel @Inject constructor(
                         safeLoadCard(dav, skipIdx)
                     }
                 }
+
             } catch (e: Exception) {
-                Log.e(TAG, "grade failed", e)
+                Log.e(TAG, "grade() unexpected error", e)
                 _state.update { it.copy(isLoading = false) }
-                _snack.emit("评分保存失败：${e.message}")
+                _snack.emit("评分失败，请重试")
             } finally {
+                // ALWAYS reset the guard, no matter what happened
                 isGrading = false
             }
         }
     }
 
-    private suspend fun safeResolveImages(
-        dav: WebDavRepository, cardPath: String, parsed: ParsedCard
-    ): Map<String, String> {
-        val names = (MarkdownParser.extractObsidianImages(parsed.question) +
-            parsed.analysis.flatMap { MarkdownParser.extractObsidianImages(it.body) }).distinct()
-        if (names.isEmpty()) return emptyMap()
-        val map = mutableMapOf<String, String>()
-        withContext(Dispatchers.IO) {
-            for (name in names) {
-                val cached = imageCache[name]
-                if (cached != null) { map[name] = cached; continue }
-                try {
-                    val bytes = dav.readFileBytes(dav.resolveImagePath(cardPath, name))
-                    if (bytes.isNotEmpty()) {
-                        val b64  = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-                        val ext  = name.substringAfterLast(".").lowercase()
-                        val mime = when(ext) { "png"->"image/png";"gif"->"image/gif";"webp"->"image/webp";else->"image/jpeg" }
-                        val uri  = "data:$mime;base64,$b64"
-                        map[name] = uri; imageCache[name] = uri
-                    }
-                } catch (_: Exception) { }
-            }
-        }
-        return map
-    }
 
-    fun addTag(tag: String) {
-        val idx  = currentIndex
-        val card = sessionCards.getOrNull(idx) ?: return
-        viewModelScope.launch(exHandler) {
-            _snack.emit("✅ 已标记：$tag")
-            withContext(Dispatchers.IO) {
-                try {
-                    val dav = webDav ?: return@withContext
-                    val raw = dav.readFile(card.path)
-                    val conflict = mapOf("难" to "易", "易" to "难")[tag]
-                    var content = raw
-                    if (content.startsWith("---")) {
-                        val end = content.indexOf("\n---", 3)
-                        if (end != -1) {
-                            var head = content.substring(0, end)
-                            if (conflict != null) head = head.replace(Regex("  - \"#?$conflict\"?\n"), "")
-                            if (!head.contains("#$tag")) {
-                                head = if (head.contains("tags:"))
-                                    head.replace(Regex("(tags:[ \\t]*\\r?\\n)"), "$1  - \"#$tag\"\n")
-                                else head + "\ntags:\n  - \"#$tag\""
-                            }
-                            content = head + content.substring(end)
-                        }
-                    } else content = "---\ntags:\n  - \"#$tag\"\n---\n\n$content"
-                    dav.writeFile(card.path, content)
-                } catch (e: Exception) { Log.e(TAG, "addTag failed", e) }
-            }
-        }
-    }
-
-    fun setDailyLimit(limit: Int) {
-        viewModelScope.launch(exHandler) {
-            savePrefs(_state.value.savedUsername, _state.value.savedPassword,
-                _state.value.savedFolderPath, limit)
-        }
-    }
-
-    fun goToFolder()    { _screen.value = Screen.Folder }
-    fun restartReview() { currentIndex = 0; sessionCards = emptyList(); startReview(_state.value.selectedFiles) }
-
-    private suspend fun buildHeatmap(): Map<String, Int> {
-        val from = LocalDate.now().minusDays(29).toString()
-        return withContext(Dispatchers.IO) { db.cardDao().getHeatmapRange(from).associate { it.date to it.count } }
-    }
-
-    private fun calcStreak(hm: Map<String, Int>): Int {
-        var s = 0
-        for (i in 0..364) {
-            if ((hm[LocalDate.now().minusDays(i.toLong()).toString()] ?: 0) > 0) s++ else if (i > 0) break
-        }
-        return s
-    }
-
-    private fun savePrefs(u: String, p: String, f: String, d: Int) {
-        viewModelScope.launch(exHandler) {
-            ctx.dataStore.edit { prefs ->
-                prefs[KEY_USERNAME]=u; prefs[KEY_PASSWORD]=p; prefs[KEY_FOLDER_PATH]=f; prefs[KEY_DAILY_LIMIT]=d
-            }
-            _state.update { it.copy(savedUsername=u, savedPassword=p, savedFolderPath=f, dailyLimit=d) }
-        }
-    }
-}
