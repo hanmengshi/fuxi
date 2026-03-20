@@ -1,5 +1,7 @@
 package com.ankireview.api
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.Credentials
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -8,21 +10,20 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
 import java.util.concurrent.TimeUnit
 
-// ── WebDAV item ──────────────────────────────────
 data class WebDavItem(
-    val href: String,          // URL path
-    val name: String,          // display name
+    val href: String,
+    val name: String,
     val isDirectory: Boolean,
     val contentType: String = "",
     val size: Long = 0L
 ) {
     val isMdFile get() = !isDirectory && name.endsWith(".md", ignoreCase = true)
-    val isImage  get() = !isDirectory && name.matches(Regex(".*\\.(png|jpg|jpeg|gif|webp|svg)", RegexOption.IGNORE_CASE))
+    val isImage  get() = !isDirectory &&
+        name.matches(Regex(".*\\.(png|jpg|jpeg|gif|webp|svg)", RegexOption.IGNORE_CASE))
 }
 
-// ── WebDAV Repository ────────────────────────────
 class WebDavRepository(
-    private val serverUrl: String,   // e.g. https://dav.jianguoyun.com/dav
+    private val serverUrl: String,
     private val username: String,
     private val password: String
 ) {
@@ -31,23 +32,42 @@ class WebDavRepository(
     }
 
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC })
+        .addInterceptor(HttpLoggingInterceptor().apply {
+            level = HttpLoggingInterceptor.Level.BASIC
+        })
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
     private val credential = Credentials.basic(username, password)
 
-    private fun baseUrl(): String = serverUrl.trimEnd('/')
+    private fun baseUrl() = serverUrl.trimEnd('/')
 
-    /** Build full URL for a given path */
     private fun url(path: String): String {
         val p = if (path.startsWith("/")) path else "/$path"
         return "${baseUrl()}$p"
     }
 
-    /** PROPFIND — list directory contents */
-    suspend fun listFolder(path: String): List<WebDavItem> {
+    suspend fun testConnection(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val body = """<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"""
+            val req = Request.Builder()
+                .url(url("/"))
+                .header("Authorization", credential)
+                .header("Depth", "0")
+                .method("PROPFIND", body.toRequestBody("application/xml; charset=utf-8".toMediaType()))
+                .build()
+            val resp = client.newCall(req).execute()
+            val code = resp.code
+            resp.close()
+            code == 207 || code in 200..299
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    suspend fun listFolder(path: String): List<WebDavItem> = withContext(Dispatchers.IO) {
         val body = """<?xml version="1.0"?>
             <d:propfind xmlns:d="DAV:">
               <d:prop>
@@ -58,76 +78,70 @@ class WebDavRepository(
               </d:prop>
             </d:propfind>""".trimIndent()
 
+        val targetUrl = if (path.isBlank() || path == "root") {
+            url("/")
+        } else {
+            url("/${path.trimStart('/')}/")
+        }
+
         val req = Request.Builder()
-            .url(url(path))
+            .url(targetUrl)
             .header("Authorization", credential)
             .header("Depth", "1")
-            .method("PROPFIND", body.toRequestBody("application/xml".toMediaType()))
+            .method("PROPFIND", body.toRequestBody("application/xml; charset=utf-8".toMediaType()))
             .build()
 
         val resp = client.newCall(req).execute()
-        if (!resp.isSuccessful) throw Exception("WebDAV 请求失败 ${resp.code}: ${resp.message}")
-        val xml = resp.body?.string() ?: return emptyList()
-        return parseWebDavResponse(xml, path)
+        if (!resp.isSuccessful && resp.code != 207) {
+            throw Exception("加载失败 (${resp.code})，请检查文件夹路径是否正确")
+        }
+        val xml = resp.body?.string() ?: return@withContext emptyList()
+        parseWebDavResponse(xml, path)
     }
 
-    /** GET — read file content as text */
-    suspend fun readFile(path: String): String {
+    suspend fun readFile(path: String): String = withContext(Dispatchers.IO) {
         val req = Request.Builder()
-            .url(url(path))
+            .url(url("/${path.trimStart('/')}"))
             .header("Authorization", credential)
             .get()
             .build()
         val resp = client.newCall(req).execute()
-        if (!resp.isSuccessful) throw Exception("读取文件失败: ${resp.code}")
-        return resp.body?.string() ?: ""
+        if (!resp.isSuccessful) throw Exception("读取文件失败 (${resp.code})")
+        resp.body?.string() ?: ""
     }
 
-    /** GET — get authenticated URL for image (returns byte array for display) */
-    suspend fun readFileBytes(path: String): ByteArray {
+    suspend fun readFileBytes(path: String): ByteArray = withContext(Dispatchers.IO) {
         val req = Request.Builder()
-            .url(url(path))
+            .url(url("/${path.trimStart('/')}"))
             .header("Authorization", credential)
             .get()
             .build()
         val resp = client.newCall(req).execute()
-        return resp.body?.bytes() ?: ByteArray(0)
+        resp.body?.bytes() ?: ByteArray(0)
     }
 
-    /** PUT — write file content */
-    suspend fun writeFile(path: String, content: String) {
+    suspend fun writeFile(path: String, content: String) = withContext(Dispatchers.IO) {
         val req = Request.Builder()
-            .url(url(path))
+            .url(url("/${path.trimStart('/')}"))
             .header("Authorization", credential)
             .put(content.toRequestBody("text/plain; charset=utf-8".toMediaType()))
             .build()
         val resp = client.newCall(req).execute()
-        if (!resp.isSuccessful) throw Exception("写入文件失败: ${resp.code}")
+        if (!resp.isSuccessful) throw Exception("写入失败 (${resp.code})")
     }
 
-    /** Test connection — returns true if credentials are valid */
-    suspend fun testConnection(): Boolean = try {
-        val req = Request.Builder()
-            .url(url("/"))
-            .header("Authorization", credential)
-            .header("Depth", "0")
-            .method("PROPFIND", "".toRequestBody("application/xml".toMediaType()))
-            .build()
-        val resp = client.newCall(req).execute()
-        resp.code in 200..299 || resp.code == 207
-    } catch (e: Exception) { false }
+    fun resolveImagePath(mdPath: String, imageName: String): String {
+        val folder = mdPath.substringBeforeLast('/', "")
+        return if (folder.isEmpty()) imageName else "$folder/$imageName"
+    }
 
-    // ── XML Parser (no external lib needed) ───────
     private fun parseWebDavResponse(xml: String, basePath: String): List<WebDavItem> {
         val items = mutableListOf<WebDavItem>()
-        // Simple regex-based XML parsing (avoids SimpleXML dependency issues)
         val responseRegex = Regex("<[Dd]:response[^>]*>(.*?)</[Dd]:response>", RegexOption.DOT_MATCHES_ALL)
         val hrefRegex     = Regex("<[Dd]:href[^>]*>(.*?)</[Dd]:href>")
         val collRegex     = Regex("<[Dd]:collection\\s*/>")
         val ctypeRegex    = Regex("<[Dd]:getcontenttype[^>]*>(.*?)</[Dd]:getcontenttype>")
         val sizeRegex     = Regex("<[Dd]:getcontentlength[^>]*>(.*?)</[Dd]:getcontentlength>")
-
-        val normalizedBase = basePath.trimEnd('/')
 
         responseRegex.findAll(xml).forEach { match ->
             val block = match.groupValues[1]
@@ -136,18 +150,16 @@ class WebDavRepository(
             val ctype = ctypeRegex.find(block)?.groupValues?.get(1)?.trim() ?: ""
             val size  = sizeRegex.find(block)?.groupValues?.get(1)?.trim()?.toLongOrNull() ?: 0L
 
-            // Decode URL-encoded characters
-            val decodedHref = java.net.URLDecoder.decode(href, "UTF-8").trimEnd('/')
-            val name = decodedHref.substringAfterLast('/')
-            if (name.isEmpty()) return@forEach  // skip self-referencing entry
+            val decoded = java.net.URLDecoder.decode(href, "UTF-8").trimEnd('/')
+            val name    = decoded.substringAfterLast('/')
+            if (name.isEmpty()) return@forEach
 
-            // Skip the folder itself
-            val normalizedHref = decodedHref.trimEnd('/')
-            val baseSegment   = normalizedBase.substringAfterLast('/')
-            if (name == baseSegment && normalizedHref.endsWith(normalizedBase)) return@forEach
+            // 跳过自身（当前目录条目）
+            val baseSegment = basePath.trimEnd('/').substringAfterLast('/')
+            if (name == baseSegment) return@forEach
 
             items.add(WebDavItem(
-                href        = decodedHref,
+                href        = decoded,
                 name        = name,
                 isDirectory = isDir,
                 contentType = ctype,
@@ -155,11 +167,5 @@ class WebDavRepository(
             ))
         }
         return items
-    }
-
-    /** Resolve image path relative to a markdown file's location */
-    fun resolveImagePath(mdPath: String, imageName: String): String {
-        val folder = mdPath.substringBeforeLast('/', "")
-        return if (folder.isEmpty()) imageName else "$folder/$imageName"
     }
 }
